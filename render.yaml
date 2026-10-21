@@ -21,7 +21,7 @@ services:
       - key: FRONTEND_ORIGINS
         sync: false
       - key: FRONTEND_URL
-        sync: false
+        value: https://buxinstore.github.io/store
       - key: MODEM_PUBLIC_KEY
         sync: false
       - key: MODEM_TEST_SECRET

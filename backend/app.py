@@ -218,17 +218,33 @@ def create_app(test_config=None):
             return allowed_origins[0]
         return ""
 
-    def storefront_base_url():
+    def storefront_base_url(candidate_url=""):
         origin = storefront_origin()
         if not origin:
             return ""
+        candidate_path = ""
+        if candidate_url:
+            candidate = urlsplit(str(candidate_url).strip())
+            candidate_origin = f"{candidate.scheme}://{candidate.netloc}" if candidate.scheme and candidate.netloc else ""
+            if (candidate_origin == origin and candidate.scheme in {"http", "https"}
+                    and not candidate.query and not candidate.fragment and ".." not in candidate.path.split("/")):
+                candidate_path = candidate.path.rstrip("/")
+                if candidate_path.endswith("/index.html"):
+                    candidate_path = candidate_path[:-len("/index.html")]
         configured = os.getenv("FRONTEND_URL", "").strip().rstrip("/")
         if configured:
             parsed = urlsplit(configured)
             configured_origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else ""
             if configured_origin == origin and parsed.scheme in {"http", "https"}:
+                configured_path = parsed.path.rstrip("/")
+                if not configured_path and candidate_path:
+                    return origin + candidate_path
+                if not configured_path and origin == "https://buxinstore.github.io":
+                    return origin + "/store"
                 return configured
-        return origin
+        if candidate_path:
+            return origin + candidate_path
+        return origin + "/store" if origin == "https://buxinstore.github.io" else origin
 
     def public_api_base_url():
         host = request.host
@@ -476,7 +492,7 @@ def create_app(test_config=None):
         if not provider_status(mode).get(provider):
             provider_name = "Modern Pay" if provider == "modem" else "PayPal"
             return error(f"{provider_name} needs valid {mode} credentials on the server", 503)
-        frontend_url = storefront_base_url()
+        frontend_url = storefront_base_url(payload.get("frontend_url", ""))
         if not frontend_url:
             return error("Storefront origin is not allowed. Configure FRONTEND_ORIGINS for the storefront URL.", 400)
         try:
