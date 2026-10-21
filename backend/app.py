@@ -403,7 +403,8 @@ def create_app(test_config=None):
             return error("Choose Modem Pay or PayPal", 400)
         mode = active_payment_mode()
         if not provider_status(mode).get(provider):
-            return error(f"{provider.title()} is not configured for {mode} mode", 503)
+            provider_name = "Modern Pay" if provider == "modem" else "PayPal"
+            return error(f"{provider_name} needs valid {mode} credentials on the server", 503)
         frontend_url = storefront_base_url()
         if not frontend_url:
             return error("Storefront origin is not allowed. Configure FRONTEND_ORIGINS for the storefront URL.", 400)
