@@ -89,6 +89,10 @@ def create_app(test_config=None):
             "paypal_amount": "NUMERIC(12, 2)",
             "paypal_exchange_rate": "NUMERIC(18, 8)",
             "paypal_rate_date": "VARCHAR(40)",
+            "modem_currency": "VARCHAR(3)",
+            "modem_amount": "NUMERIC(12, 2)",
+            "modem_exchange_rate": "NUMERIC(18, 8)",
+            "modem_rate_date": "VARCHAR(40)",
         }
         for column, sql_type in attempt_migrations.items():
             if column not in attempt_columns:
@@ -133,8 +137,8 @@ def create_app(test_config=None):
             return DEFAULT_SHIPPING_METHODS
         return methods if isinstance(methods, list) else DEFAULT_SHIPPING_METHODS
 
-    def paypal_conversion():
-        setting = db.session.get(StoreSetting, "paypal_gmd_usd_rate")
+    def usd_gmd_conversion():
+        setting = db.session.get(StoreSetting, "usd_gmd_exchange_rate")
         cached = None
         if setting:
             try:
@@ -158,12 +162,12 @@ def create_app(test_config=None):
                 raise ValueError("Exchange rate response was invalid")
             rate_date = str(data.get("time_last_update_utc", ""))
             updated_at = datetime.now(timezone.utc).isoformat()
-            converted = {"currency": "USD", "gmd_to_usd": str(rate), "rate_date": rate_date, "updated_at": updated_at}
-            setting = db.session.get(StoreSetting, "paypal_gmd_usd_rate")
+            converted = {"currency": "GMD", "usd_to_gmd": str(Decimal(1) / rate), "rate_date": rate_date, "updated_at": updated_at}
+            setting = db.session.get(StoreSetting, "usd_gmd_exchange_rate")
             if setting:
                 setting.value = json.dumps(converted)
             else:
-                db.session.add(StoreSetting(key="paypal_gmd_usd_rate", value=json.dumps(converted)))
+                db.session.add(StoreSetting(key="usd_gmd_exchange_rate", value=json.dumps(converted)))
             db.session.commit()
             return converted
         except (HTTPError, URLError, TimeoutError, ValueError, InvalidOperation, json.JSONDecodeError):
@@ -177,8 +181,8 @@ def create_app(test_config=None):
                         return cached
                 except (KeyError, TypeError, ValueError):
                     pass
-            app.logger.exception("Could not retrieve PayPal currency conversion rate")
-            raise RuntimeError("PayPal currency conversion is temporarily unavailable")
+            app.logger.exception("Could not retrieve USD to GMD exchange rate")
+            raise RuntimeError("Modern Pay currency conversion is temporarily unavailable")
 
     def payment_secret(provider, mode):
         if provider == "modem":
@@ -195,8 +199,7 @@ def create_app(test_config=None):
         ).strip()
         status = {
             "modem": modem_secret.startswith("sk_live_" if mode == "live" else "sk_test_")
-            and bool(modem_webhook_secret)
-            and os.getenv("PAYMENT_CURRENCY", "GMD").strip().upper() == "GMD",
+            and bool(modem_webhook_secret),
             "paypal": bool(
                 payment_secret("paypal", mode)
                 and os.getenv("PAYPAL_LIVE_CLIENT_ID" if mode == "live" else "PAYPAL_SANDBOX_CLIENT_ID", "").strip()
@@ -456,12 +459,12 @@ def create_app(test_config=None):
         methods = [item for item in shipping_methods() if item.get("enabled", True)]
         providers = provider_status(mode)
         conversion = None
-        if providers.get("paypal"):
+        if providers.get("modem"):
             try:
-                conversion = paypal_conversion()
+                conversion = usd_gmd_conversion()
             except RuntimeError:
-                providers["paypal"] = False
-        return jsonify(mode=mode, providers=providers, currency=os.getenv("PAYMENT_CURRENCY", "GMD").strip().upper(), shipping_methods=methods, paypal_conversion=conversion)
+                providers["modem"] = False
+        return jsonify(mode=mode, providers=providers, currency="USD", shipping_methods=methods, modem_conversion=conversion)
 
     @app.post("/api/payments/checkout")
     def create_payment_checkout():
@@ -478,9 +481,6 @@ def create_app(test_config=None):
             return error("Storefront origin is not allowed. Configure FRONTEND_ORIGINS for the storefront URL.", 400)
         try:
             order = build_order(payload, provider)
-            if provider == "modem" and order.total < Decimal("10.00"):
-                db.session.rollback()
-                return error("Modem Pay requires a minimum payment of GMD 10.00", 400)
             db.session.commit()
         except ValueError as exc:
             db.session.rollback()
@@ -500,14 +500,20 @@ def create_app(test_config=None):
         success_url = frontend_url + "/?payment=success&order_id=" + order.id
         cancel_url = frontend_url + "/?payment=cancelled&order_id=" + order.id
         conversion = None
+        modem_amount = None
         paypal_amount = None
         try:
             if provider == "modem":
+                conversion = usd_gmd_conversion()
+                modem_rate = Decimal(conversion["usd_to_gmd"])
+                modem_amount = Decimal(order.total * modem_rate).quantize(Decimal("0.01"))
+                if modem_amount < Decimal("10.00"):
+                    raise RuntimeError("Modern Pay requires a converted payment of at least GMD 10.00")
                 secret = payment_secret("modem", mode)
                 callback_url = public_api_base_url() + "/api/payments/modem/webhook"
                 result = provider_request("https://api.modempay.com/v1/payments", {
                     "data": {
-                        "amount": float(Decimal(order.total)),
+                        "amount": float(modem_amount),
                         "currency": "GMD",
                         "title": "Store order " + order.id,
                         "description": "Store order payment",
@@ -522,10 +528,8 @@ def create_app(test_config=None):
                 provider_reference = payment_data.get("id") or payment_data.get("intent_secret")
                 checkout_url = payment_data.get("payment_link")
             else:
-                conversion = paypal_conversion()
-                paypal_rate = Decimal(conversion["gmd_to_usd"])
-                paypal_amount = Decimal(order.total * paypal_rate).quantize(Decimal("0.01"))
-                paypal_subtotal = Decimal(order.subtotal * paypal_rate).quantize(Decimal("0.01"))
+                paypal_amount = Decimal(order.total).quantize(Decimal("0.01"))
+                paypal_subtotal = Decimal(order.subtotal).quantize(Decimal("0.01"))
                 paypal_shipping = paypal_amount - paypal_subtotal
                 token, api_base = paypal_access_token(mode)
                 purchase_unit = {
@@ -552,9 +556,10 @@ def create_app(test_config=None):
             db.session.add(PaymentAttempt(
                 order_id=order.id, provider=provider, provider_reference=provider_reference,
                 mode=mode, status="pending", frontend_url=frontend_url,
-                paypal_currency="USD" if conversion else None, paypal_amount=paypal_amount,
-                paypal_exchange_rate=Decimal(conversion["gmd_to_usd"]) if conversion else None,
-                paypal_rate_date=conversion["rate_date"][:40] if conversion else None,
+                paypal_currency="USD" if provider == "paypal" else None, paypal_amount=paypal_amount,
+                modem_currency="GMD" if provider == "modem" else None, modem_amount=modem_amount,
+                modem_exchange_rate=Decimal(conversion["usd_to_gmd"]) if provider == "modem" else None,
+                modem_rate_date=conversion["rate_date"][:40] if provider == "modem" else None,
             ))
             db.session.commit()
             return jsonify(order_id=order.id, checkout_url=checkout_url, mode=mode), 201
@@ -576,8 +581,8 @@ def create_app(test_config=None):
             return error("Order not found", 404)
         attempt = PaymentAttempt.query.filter_by(order_id=order.id, status="paid").first()
         return jsonify(order_id=order.id, payment_status=order.payment_status, status=order.status, total=float(order.total),
-                       payment_currency=attempt.paypal_currency if attempt else "GMD",
-                       payment_amount=float(attempt.paypal_amount) if attempt and attempt.paypal_amount is not None else float(order.total))
+                       payment_currency=((attempt.paypal_currency or attempt.modem_currency) if attempt else "USD") or "USD",
+                       payment_amount=float(attempt.paypal_amount if attempt.paypal_amount is not None else attempt.modem_amount) if attempt and (attempt.paypal_amount is not None or attempt.modem_amount is not None) else float(order.total))
 
     @app.post("/api/payments/modem/webhook")
     def modem_webhook():
@@ -610,8 +615,10 @@ def create_app(test_config=None):
             return error("Payment attempt not found", 404)
         order = attempt.order
         if event_type == "charge.succeeded":
-            if (payment.get("status") == "completed" and payment.get("currency") == "GMD"
-                    and Decimal(str(payment.get("amount", 0))) == Decimal(order.total)):
+            expected_amount = Decimal(attempt.modem_amount if attempt.modem_amount is not None else order.total)
+            expected_currency = attempt.modem_currency or "GMD"
+            if (payment.get("status") == "completed" and payment.get("currency") == expected_currency
+                    and Decimal(str(payment.get("amount", 0))) == expected_amount):
                 order.payment_status = "paid"
                 order.status = "processing"
                 attempt.status = "paid"
@@ -638,7 +645,7 @@ def create_app(test_config=None):
             })
             captures = [c for unit in capture.get("purchase_units", []) for c in unit.get("payments", {}).get("captures", [])]
             paid_amount = sum((Decimal(c.get("amount", {}).get("value", "0")) for c in captures if c.get("status") == "COMPLETED"), Decimal("0.00"))
-            expected_currency = attempt.paypal_currency or "GMD"
+            expected_currency = attempt.paypal_currency or "USD"
             expected_amount = Decimal(attempt.paypal_amount if attempt.paypal_amount is not None else order.total)
             capture_currency = next((c.get("amount", {}).get("currency_code") for c in captures if c.get("status") == "COMPLETED"), None)
             if capture.get("status") != "COMPLETED" or paid_amount != expected_amount or capture_currency != expected_currency:
@@ -705,7 +712,7 @@ def create_app(test_config=None):
                 if not name or not method_id or not method_id.replace("-", "").replace("_", "").isalnum() or method_id in ids:
                     return error("Shipping method names and IDs must be valid and unique", 400)
                 if not price.is_finite() or price < 0 or price > Decimal("100000"):
-                    return error("Shipping prices must be between GMD 0 and GMD 100,000", 400)
+                    return error("Shipping prices must be between USD 0 and USD 100,000", 400)
                 ids.add(method_id)
                 methods.append({"id": method_id, "name": name, "price": f"{price:.2f}", "enabled": bool(item.get("enabled", True))})
             setting = db.session.get(StoreSetting, "shipping_methods")

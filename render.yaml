@@ -31,7 +31,7 @@ services:
       - key: MODEM_WEBHOOK_SECRET
         sync: false
       - key: PAYMENT_CURRENCY
-        value: GMD
+        value: USD
       - key: PAYPAL_SANDBOX_CLIENT_ID
         sync: false
       - key: PAYPAL_SANDBOX_SECRET

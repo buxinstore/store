@@ -47,7 +47,7 @@ The repository-root `render.yaml` describes the API web service. Deploy it as a 
 - `FRONTEND_ORIGINS`: your GitHub Pages origin, such as `https://your-user.github.io` (origin only; no repository path).
 - `FRONTEND_URL`: the full storefront base URL, including the GitHub Pages repository path when applicable (for example, `https://your-user.github.io/store`).
 - `MODEM_TEST_SECRET` and `MODEM_TEST_WEBHOOK_SECRET` for Modem Pay test mode; set the webhook endpoint to `/api/payments/modem/webhook`.
-- `MODEM_LIVE_SECRET` and `MODEM_WEBHOOK_SECRET` for Modem Pay live mode. Set `PAYMENT_CURRENCY=GMD`; Modem Pay checkout uses GMD.
+- `MODEM_LIVE_SECRET` and `MODEM_WEBHOOK_SECRET` for Modem Pay live mode. Set `PAYMENT_CURRENCY=USD`; storefront prices and order totals use USD, while Modem Pay checkout converts the final amount to GMD.
 - `PAYPAL_SANDBOX_CLIENT_ID` and `PAYPAL_SANDBOX_SECRET` for PayPal sandbox; `PAYPAL_LIVE_CLIENT_ID` and `PAYPAL_LIVE_SECRET` for production.
 - `ENABLE_LIVE_PAYMENTS`: leave `false` while testing. Set to `true` only when you are ready to enable live credentials; the admin mode selector cannot switch to live while this flag is off.
 
@@ -86,6 +86,6 @@ Admin tokens expire after eight hours. Use HTTPS in production. With `API_BASE_U
 
 ## Payments and security
 
-Online checkout collects the customer's full delivery details, including phone, country, street, city, region, and postal code, then offers the enabled shipping methods. Carrier names and GMD prices are managed from Admin → Store Settings and saved in the database. The API validates the address and selected carrier and recalculates shipping and order totals before creating a provider-hosted checkout. Modem Pay payments are only marked paid after a signature-verified webhook confirms the amount and currency. PayPal orders are captured server-side after the buyer returns from approval. The app defaults to test mode, and live mode also requires `ENABLE_LIVE_PAYMENTS=true`. Use provider sandbox accounts and test payment methods for checkout tests; never enter card details into the storefront itself.
+Online checkout collects the customer's full delivery details, including phone, country, street, city, region, and postal code, then offers the enabled shipping methods. Catalog, shipping, and order totals are managed in USD. The API validates the address and selected carrier and recalculates order totals before creating provider-hosted checkout. PayPal charges USD directly; Modern Pay converts the final USD amount to GMD using the current cached exchange rate and confirms that GMD amount through a signature-verified webhook. The app defaults to test mode, and live mode also requires `ENABLE_LIVE_PAYMENTS=true`. Use provider sandbox accounts and test payment methods for checkout tests; never enter card details into the storefront itself.
 
 The admin login uses an expiring signed bearer token and environment-based credentials. Before launch, use unique production secrets, restrict CORS to the exact Pages origin, and review rate limits, password reset, order privacy, database backups, and migrations.

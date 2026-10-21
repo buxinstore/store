@@ -181,4 +181,8 @@ class PaymentAttempt(db.Model):
     paypal_amount = db.Column(Numeric(12, 2))
     paypal_exchange_rate = db.Column(Numeric(18, 8))
     paypal_rate_date = db.Column(db.String(40))
+    modem_currency = db.Column(db.String(3))
+    modem_amount = db.Column(Numeric(12, 2))
+    modem_exchange_rate = db.Column(Numeric(18, 8))
+    modem_rate_date = db.Column(db.String(40))
     order = db.relationship("Order", lazy="joined")
