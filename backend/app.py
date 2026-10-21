@@ -54,7 +54,8 @@ def create_app(test_config=None):
         app.config.update(test_config)
 
     db.init_app(app)
-    origins = [origin.strip() for origin in os.getenv("FRONTEND_ORIGINS", "*").split(",") if origin.strip()]
+    configured_origins = [origin.strip() for origin in os.getenv("FRONTEND_ORIGINS", "*").split(",") if origin.strip()]
+    origins = list(dict.fromkeys([*configured_origins, "https://buxinstore.github.io"]))
     CORS(
         app,
         resources={r"/api/*": {"origins": origins}},
