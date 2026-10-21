@@ -546,15 +546,15 @@ def create_app(test_config=None):
 
     @app.post("/api/admin/login")
     def admin_login():
-        configured_user = os.getenv("ADMIN_USERNAME", "")
+        configured_user = os.getenv("ADMIN_EMAIL", "").strip() or os.getenv("ADMIN_USERNAME", "")
         configured_password = os.getenv("ADMIN_PASSWORD", "")
         payload = request.get_json(silent=True) or {}
-        username = str(payload.get("username", ""))
+        username = str(payload.get("email", payload.get("username", "")))
         password = str(payload.get("password", ""))
         if not configured_user or not configured_password:
             return error("Admin credentials are not configured", 503)
         if not hmac.compare_digest(username, configured_user) or not hmac.compare_digest(password, configured_password):
-            return error("Incorrect username or password", 401)
+            return error("Incorrect email or password", 401)
         token = URLSafeTimedSerializer(app.config["SECRET_KEY"], salt="electrohub-admin").dumps(
             {"sub": configured_user}
         )

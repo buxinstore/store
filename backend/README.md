@@ -6,7 +6,7 @@ Flask REST API for the storefront. PostgreSQL is the production database (Neon),
 
 1. Create a Neon project and copy its pooled PostgreSQL connection string. Keep the `sslmode=require` query parameter.
 2. Create a Cloudinary product environment and copy its `CLOUDINARY_URL` from the dashboard.
-3. Copy the repository-root `.env.example` to the repository-root `.env`, then fill in `DATABASE_URL`, `CLOUDINARY_URL`, `SECRET_KEY`, `ADMIN_USERNAME`, `ADMIN_PASSWORD`, `FRONTEND_ORIGINS`, and provider credentials. The backend loads this root `.env` even when started from `backend/`.
+3. Copy the repository-root `.env.example` to the repository-root `.env`, then fill in `DATABASE_URL`, `CLOUDINARY_URL`, `SECRET_KEY`, `ADMIN_EMAIL` (or legacy `ADMIN_USERNAME`) and `ADMIN_PASSWORD`, `FRONTEND_ORIGINS`, and provider credentials. The backend loads this root `.env` even when started from `backend/`.
 4. From this folder, install and run:
 
    ```powershell
