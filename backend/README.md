@@ -57,7 +57,7 @@ The app starts with Gunicorn and checks `/api/health` during deploy. Never put d
 
 `.github/workflows/pages.yml` publishes only `index.html`, `config.js`, and `assets/`; the Python backend is excluded. Set the repository Actions variable `API_BASE_URL` to the Render service URL (for example, `https://electrohub-api.onrender.com`). Enable GitHub Pages with **Build and deployment → Source: GitHub Actions**. The workflow injects the public API URL into `config.js` at deploy time.
 
-Without `API_BASE_URL`, the storefront keeps its local demo behavior. With it, the storefront loads catalog data and submits orders to the API. Checkout can offer cash on delivery, Modem Pay hosted checkout, and PayPal approval when credentials exist for the selected mode. Payment mode is stored server-side and defaults to test. The admin Store Settings page controls test or live mode; live mode can charge real customers. Provider credentials remain server-side.
+Without `API_BASE_URL`, the storefront keeps its local demo catalog, but checkout is unavailable. With it, checkout offers only Modem Pay hosted checkout and PayPal approval when the matching credentials are configured for the active server-side payment mode. Unconfigured providers are disabled; checkout never presents a demo payment or accepts an order without a payment provider. Payment mode defaults to test. The admin Store Settings page controls test or live mode; live mode can charge real customers. Provider credentials remain server-side.
 
 ## API
 
