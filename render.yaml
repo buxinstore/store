@@ -1,0 +1,44 @@
+services:
+  - type: web
+    name: electrohub-api
+    runtime: python
+    rootDir: backend
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn --bind 0.0.0.0:$PORT app:app
+    healthCheckPath: /api/health
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: CLOUDINARY_URL
+        sync: false
+      - key: SECRET_KEY
+        generateValue: true
+      - key: ADMIN_USERNAME
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: FRONTEND_ORIGINS
+        sync: false
+      - key: FRONTEND_URL
+        sync: false
+      - key: MODEM_TEST_SECRET
+        sync: false
+      - key: MODEM_TEST_WEBHOOK_SECRET
+        sync: false
+      - key: MODEM_LIVE_SECRET
+        sync: false
+      - key: MODEM_WEBHOOK_SECRET
+        sync: false
+      - key: PAYMENT_CURRENCY
+        value: GMD
+      - key: PAYPAL_SANDBOX_CLIENT_ID
+        sync: false
+      - key: PAYPAL_SANDBOX_SECRET
+        sync: false
+      - key: PAYPAL_LIVE_CLIENT_ID
+        sync: false
+      - key: PAYPAL_LIVE_SECRET
+        sync: false
+      - key: ENABLE_LIVE_PAYMENTS
+        value: "false"
