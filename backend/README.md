@@ -51,6 +51,10 @@ The repository-root `render.yaml` describes the API web service. Deploy it as a 
 - `MODEM_LIVE_SECRET` and `MODEM_WEBHOOK_SECRET` for Modem Pay live mode. Set `PAYMENT_CURRENCY=USD`; storefront prices and order totals use USD, while Modem Pay checkout converts the final amount to GMD.
 - `PAYPAL_SANDBOX_CLIENT_ID` and `PAYPAL_SANDBOX_SECRET` for PayPal sandbox; `PAYPAL_LIVE_CLIENT_ID` and `PAYPAL_LIVE_SECRET` for production.
 - `ENABLE_LIVE_PAYMENTS`: leave `false` while testing. Set to `true` only when you are ready to enable live credentials; the admin mode selector cannot switch to live while this flag is off.
+- `XAI_API_KEY`: private xAI key used only by backend shipping research. Keep it out of GitHub Pages and the browser.
+- `XAI_MODEL` (default `grok-4.7`), `SHIPPING_WEIGHT_BANDS_KG`, `SHIPPING_ESTIMATE_MAX_AGE_DAYS`, `SHIPPING_ESTIMATE_MAX_DESTINATIONS_PER_RUN`, and `SHIPPING_MAX_DESTINATIONS_PER_UTC_DAY` configure the research model, weight bands, freshness, and daily destination research budget. Each researched destination may use up to three HTTP attempts if retries are needed.
+
+The Blueprint defines a daily Render Cron job (`electrohub-shipping-refresh`, 03:00 UTC) that refreshes at most ten destinations per run. Render Cron has a minimum monthly charge, so review Render's current pricing. Existing dashboard-created services do not necessarily apply new Blueprint resources automatically: sync the Blueprint or create the cron job with the same command and environment before expecting daily refreshes. The cron and manual refresh paths share a database lock.
 
 The app starts with Gunicorn and checks `/api/health` during deploy. Never put database, Cloudinary, or admin secrets in the GitHub Pages files.
 
@@ -68,6 +72,8 @@ Public routes:
 - `GET /api/categories`
 - `GET /api/products?q=&category=&featured=&limit=`
 - `GET /api/products/<id>`
+- `GET /api/shipping/destinations`, `POST /api/shipping/estimate`
+- `GET /api/shipping-adjustments/<token>`, `POST /api/shipping-adjustments/<token>`
 - `POST /api/orders` (cash on delivery)
 - `GET /api/payments/config`
 - `POST /api/payments/checkout`
@@ -81,6 +87,8 @@ Admin routes require a bearer token from `POST /api/admin/login`:
 - `GET /api/admin/categories`, `POST /api/admin/categories`
 - `GET /api/admin/orders`, `PATCH /api/admin/orders/<order-id>`
 - `GET /api/admin/payment-settings`, `PUT /api/admin/payment-settings`
+- `GET /api/admin/shipping`, `GET /api/admin/shipping/<id>/history`, `POST /api/admin/shipping/refresh`, `PUT /api/admin/shipping/override`
+- `PUT /api/admin/orders/<id>/shipping-reconciliation`, `POST /api/admin/orders/<id>/shipping-reconciliation/resolve`
 - `POST /api/admin/uploads` (`multipart/form-data`, field name `image`)
 
 Admin tokens expire after eight hours. Use HTTPS in production. With `API_BASE_URL` configured, the storefront Admin page can sign in to this API, view live product/category/order data, edit product stock, and update order statuses. The login token is kept in the current browser session. Settings and account registration are still frontend demo-only.
@@ -90,3 +98,11 @@ Admin tokens expire after eight hours. Use HTTPS in production. With `API_BASE_U
 Online checkout collects the customer's full delivery details, including phone, country, street, city, region, and postal code, then offers the enabled shipping methods. Catalog, shipping, and order totals are managed in USD. The API validates the address and selected carrier and recalculates order totals before creating provider-hosted checkout. PayPal charges USD directly; Modern Pay converts the final USD amount to GMD using the current cached exchange rate and confirms that GMD amount through a signature-verified webhook. The app defaults to test mode, and live mode also requires `ENABLE_LIVE_PAYMENTS=true`. Use provider sandbox accounts and test payment methods for checkout tests; never enter card details into the storefront itself.
 
 The admin login uses an expiring signed bearer token and environment-based credentials. Before launch, use unique production secrets, restrict CORS to the exact Pages origin, and review rate limits, password reset, order privacy, database backups, and migrations.
+
+## AI shipping estimates
+
+Checkout uses destination-specific, source-linked indicative estimates from Shenzhen, China. Every product needs a positive shipping weight in kilograms; enter weights in Admin → Products & Inventory. Billable weight is the sum of product weight × quantity, with a 0.5 kg minimum and upward rounding to the next 0.5 kg. Checkout displays the estimate in USD with its research date and citations, requires customer acknowledgment, rechecks freshness on the server, and stores the estimate snapshot with the order.
+
+The backend calls the xAI Responses API with web search and structured output. Source currencies are converted to USD using a reference FX endpoint, and the conversion snapshot is retained. Missing weights, missing citations, missing or expired rates, or an unavailable Grok key result in manual review; the system does not substitute a zero charge. Rates are indicative, not binding carrier quotes. The customer pays the amount they explicitly approved. The app does not yet connect final carrier invoices, email customers, automatically collect post-shipment differences, or issue provider refunds; handle final reconciliation/refunds outside the app until those integrations are implemented. Admin overrides are manually reviewed and retained in estimate history.
+
+Database changes use safe additive startup migrations, following the existing `db.create_all()` pattern; this project does not use Alembic. Existing products remain without weights after migration, so populate them before accepting shipped orders. Run the shipping unit tests from `backend/` with `python -m unittest discover -s tests` after installing backend requirements.

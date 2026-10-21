@@ -57,6 +57,7 @@ class Product(db.Model):
     cloudinary_public_id = db.Column(db.String(300))
     sku = db.Column(db.String(100), unique=True)
     stock = db.Column(db.Integer, nullable=False, default=0)
+    weight_kg = db.Column(Numeric(8, 3))
     rating = db.Column(Numeric(2, 1), nullable=False, default=Decimal("0.0"))
     is_active = db.Column(db.Boolean, nullable=False, default=True)
     is_featured = db.Column(db.Boolean, nullable=False, default=False)
@@ -78,6 +79,7 @@ class Product(db.Model):
             "cloudinary_public_id": self.cloudinary_public_id,
             "sku": self.sku,
             "stock": self.stock,
+            "weight_kg": float(self.weight_kg) if self.weight_kg is not None else None,
             "rating": float(self.rating),
             "is_active": self.is_active,
             "is_featured": self.is_featured,
@@ -101,6 +103,9 @@ class Order(db.Model):
     city = db.Column(db.String(120), nullable=False)
     postal_code = db.Column(db.String(32), nullable=False)
     shipping_method = db.Column(db.String(120), nullable=False, default="standard")
+    shipping_snapshot = db.Column(db.Text)
+    shipping_acknowledged_at = db.Column(db.DateTime(timezone=True))
+    shipping_reconciliation = db.relationship("ShippingReconciliation", back_populates="order", uselist=False, cascade="all, delete-orphan", lazy="joined")
     payment_method = db.Column(db.String(50), nullable=False)
     payment_status = db.Column(db.String(40), nullable=False, default="unpaid")
     status = db.Column(db.String(40), nullable=False, default="pending")
@@ -123,6 +128,8 @@ class Order(db.Model):
             "email": self.email,
             "shipping_address": shipping_address,
             "shipping_method": getattr(self, "shipping_method", ""),
+            "shipping_snapshot": json.loads(self.shipping_snapshot) if getattr(self, "shipping_snapshot", None) else None,
+            "shipping_reconciliation": self.shipping_reconciliation.to_dict() if self.shipping_reconciliation else None,
             "payment_method": self.payment_method,
             "payment_status": self.payment_status,
             "status": self.status,
@@ -165,6 +172,81 @@ class StoreSetting(db.Model):
 
     key = db.Column(db.String(80), primary_key=True)
     value = db.Column(db.Text, nullable=False)
+
+
+class ShippingEstimate(db.Model):
+    __tablename__ = "shipping_estimates"
+    __table_args__ = (UniqueConstraint("country_code", "weight_kg", name="uq_shipping_country_weight"),)
+
+    id = db.Column(db.Integer, primary_key=True)
+    country_code = db.Column(db.String(2), nullable=False, index=True)
+    country_name = db.Column(db.String(120), nullable=False)
+    weight_kg = db.Column(Numeric(8, 3), nullable=False)
+    price_usd = db.Column(Numeric(10, 2))
+    status = db.Column(db.String(24), nullable=False, default="manual_review")
+    confidence = db.Column(db.String(16))
+    sources = db.Column(db.Text)
+    fx_snapshot = db.Column(db.Text)
+    notes = db.Column(db.Text)
+    researched_at = db.Column(db.DateTime(timezone=True))
+    expires_at = db.Column(db.DateTime(timezone=True))
+    manual_override = db.Column(db.Boolean, nullable=False, default=False)
+    updated_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
+
+
+class ShippingEstimateHistory(db.Model):
+    __tablename__ = "shipping_estimate_history"
+    id = db.Column(db.Integer, primary_key=True)
+    estimate_id = db.Column(db.Integer, nullable=False, index=True)
+    snapshot = db.Column(db.Text, nullable=False)
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow)
+
+
+class ShippingRefreshJob(db.Model):
+    __tablename__ = "shipping_refresh_jobs"
+    id = db.Column(db.Integer, primary_key=True)
+    status = db.Column(db.String(20), nullable=False, default="running")
+    attempted = db.Column(db.Integer, nullable=False, default=0)
+    succeeded = db.Column(db.Integer, nullable=False, default=0)
+    failed = db.Column(db.Integer, nullable=False, default=0)
+    message = db.Column(db.Text)
+    started_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow)
+    finished_at = db.Column(db.DateTime(timezone=True))
+
+
+class ShippingRefreshLock(db.Model):
+    __tablename__ = "shipping_refresh_lock"
+    id = db.Column(db.Integer, primary_key=True, default=1)
+    locked_until = db.Column(db.DateTime(timezone=True), nullable=False)
+
+
+class ShippingReconciliation(db.Model):
+    __tablename__ = "shipping_reconciliations"
+    id = db.Column(db.Integer, primary_key=True)
+    order_id = db.Column(db.String(36), db.ForeignKey("orders.id", ondelete="CASCADE"), nullable=False, unique=True, index=True)
+    status = db.Column(db.String(40), nullable=False, default="awaiting_final_cost")
+    quoted_usd = db.Column(Numeric(10, 2), nullable=False)
+    final_usd = db.Column(Numeric(10, 2))
+    difference_usd = db.Column(Numeric(10, 2))
+    reason = db.Column(db.Text)
+    approval_token_hash = db.Column(db.String(64))
+    approval_expires_at = db.Column(db.DateTime(timezone=True))
+    customer_decision = db.Column(db.String(16))
+    customer_decided_at = db.Column(db.DateTime(timezone=True))
+    refund_reference = db.Column(db.String(200))
+    resolved_at = db.Column(db.DateTime(timezone=True))
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
+    order = db.relationship("Order", back_populates="shipping_reconciliation")
+
+    def to_dict(self):
+        return {"status": self.status, "quoted_usd": float(self.quoted_usd),
+                "final_usd": float(self.final_usd) if self.final_usd is not None else None,
+                "difference_usd": float(self.difference_usd) if self.difference_usd is not None else None,
+                "reason": self.reason, "customer_decision": self.customer_decision,
+                "customer_decided_at": self.customer_decided_at.isoformat() if self.customer_decided_at else None,
+                "refund_reference": self.refund_reference,
+                "resolved_at": self.resolved_at.isoformat() if self.resolved_at else None}
 
 
 class PaymentAttempt(db.Model):

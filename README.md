@@ -6,7 +6,7 @@ A static storefront frontend with a Flask API backend, PostgreSQL/Neon storage, 
 
 - `index.html`, `assets/`, `config.js`: static storefront published by GitHub Pages.
 - `backend/`: Flask REST API, PostgreSQL models, demo seed data, and Cloudinary uploader.
-- `render.yaml`: Render Blueprint for the Flask web service.
+- `render.yaml`: Render Blueprint for the Flask web service and scheduled shipping refresh job.
 - `.github/workflows/pages.yml`: publishes only the static frontend files.
 
 ## Local backend

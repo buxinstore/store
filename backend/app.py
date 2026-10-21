@@ -3,7 +3,8 @@ import hmac
 import hashlib
 import json
 import os
-from datetime import datetime, timezone
+import secrets
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from functools import wraps
 from pathlib import Path
@@ -22,8 +23,10 @@ from sqlalchemy import inspect, text
 from sqlalchemy.exc import SQLAlchemyError
 from werkzeug.exceptions import RequestEntityTooLarge
 
-from models import Category, Order, OrderItem, PaymentAttempt, Product, StoreSetting, db
+from models import Category, Order, OrderItem, PaymentAttempt, Product, StoreSetting, ShippingEstimate, ShippingEstimateHistory, ShippingRefreshJob, ShippingReconciliation, db
 from catalog_seed import seed_starter_catalog
+from shipping import refresh_destinations
+from shipping_core import billable_weight, estimate_is_current, safe_sources
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
@@ -79,6 +82,21 @@ def create_app(test_config=None):
         if "shipping_method" not in columns:
             with db.engine.begin() as connection:
                 connection.execute(text("ALTER TABLE orders ADD COLUMN shipping_method VARCHAR(120) NOT NULL DEFAULT 'standard'"))
+        product_columns = {column["name"] for column in inspect(db.engine).get_columns("products")}
+        if "weight_kg" not in product_columns:
+            with db.engine.begin() as connection:
+                connection.execute(text("ALTER TABLE products ADD COLUMN weight_kg NUMERIC(8, 3)"))
+        estimate_columns = {column["name"] for column in inspect(db.engine).get_columns("shipping_estimates")}
+        if "fx_snapshot" not in estimate_columns:
+            with db.engine.begin() as connection:
+                connection.execute(text("ALTER TABLE shipping_estimates ADD COLUMN fx_snapshot TEXT"))
+        order_columns = {column["name"] for column in inspect(db.engine).get_columns("orders")}
+        if "shipping_snapshot" not in order_columns:
+            with db.engine.begin() as connection:
+                connection.execute(text("ALTER TABLE orders ADD COLUMN shipping_snapshot TEXT"))
+        if "shipping_acknowledged_at" not in order_columns:
+            with db.engine.begin() as connection:
+                connection.execute(text("ALTER TABLE orders ADD COLUMN shipping_acknowledged_at TIMESTAMP WITH TIME ZONE"))
         if db.engine.dialect.name == "postgresql":
             with db.engine.begin() as connection:
                 connection.execute(text("ALTER TABLE orders ALTER COLUMN address TYPE TEXT"))
@@ -291,16 +309,7 @@ def create_app(test_config=None):
             not str(address.get(field, "")).strip() for field in ("address", "city", "region", "postal_code", "country", "phone")
         ):
             raise ValueError("Enter your name, email, phone, and complete delivery address")
-        selected_method = str(payload.get("shipping_method", "")).strip()
-        method = next((item for item in shipping_methods() if item.get("id") == selected_method and item.get("enabled", True)), None)
-        if not method:
-            raise ValueError("Choose an available shipping method")
-        try:
-            shipping = Decimal(str(method.get("price", ""))).quantize(Decimal("0.01"))
-        except (InvalidOperation, ValueError):
-            raise ValueError("The selected shipping method has an invalid price")
-        if not shipping.is_finite() or shipping < 0 or shipping > Decimal("100000"):
-            raise ValueError("The selected shipping method has an invalid price")
+        estimate = None
         lines = payload.get("items")
         if not isinstance(lines, list) or not lines or len(lines) > 100:
             raise ValueError("Order must include between 1 and 100 items")
@@ -329,10 +338,34 @@ def create_app(test_config=None):
                 raise ArithmeticError(f"Insufficient stock for {product.name}")
             subtotal += Decimal(product.price) * quantity
             order_lines.append((product, quantity))
+        country_code = str(address.get("country_code", address.get("country", ""))).strip().upper()
+        if len(country_code) != 2 or payload.get("shipping_acknowledged") is not True:
+            raise ValueError("Select your destination country and acknowledge the shipping estimate")
+        try:
+            actual_weight = sum((Decimal(product.weight_kg) * quantity for product, quantity in order_lines), Decimal("0"))
+        except (TypeError, InvalidOperation):
+            raise ValueError("A product is missing a valid shipping weight; contact support for a manual quote")
+        band = billable_weight(actual_weight)
+        try:
+            estimate_id = int(payload.get("shipping_estimate_id", 0))
+        except (TypeError, ValueError):
+            estimate_id = 0
+        estimate = db.session.get(ShippingEstimate, estimate_id)
+        if not estimate or estimate.country_code != country_code or estimate.weight_kg != band or not estimate_is_current(estimate):
+            raise ValueError("A current shipping estimate is not available for this destination and weight; contact support for a manual quote")
+        shipping = Decimal(estimate.price_usd).quantize(Decimal("0.01"))
+        snapshot = {"estimate_id": estimate.id, "country_code": country_code, "country_name": estimate.country_name,
+                    "actual_weight_kg": str(actual_weight), "billable_weight_kg": str(band), "currency": "USD",
+                    "price_usd": str(shipping), "sources": safe_sources(estimate.sources),
+                    "fx_snapshot": json.loads(estimate.fx_snapshot) if estimate.fx_snapshot else None,
+                    "researched_at": estimate.researched_at.isoformat() if estimate.researched_at else None,
+                    "expires_at": estimate.expires_at.isoformat() if estimate.expires_at else None,
+                    "disclaimer": "Indicative shipping estimate; final carrier charges can vary."}
         order = Order(
             id=str(uuid4()), customer_name=str(payload["customer_name"]).strip()[:180],
             email=str(payload["email"]).strip()[:254], address=json.dumps({key: str(value).strip() for key, value in address.items()}, ensure_ascii=False),
-            city=str(address["city"]).strip()[:120], postal_code=str(address["postal_code"]).strip()[:32], shipping_method=method["name"],
+            city=str(address["city"]).strip()[:120], postal_code=str(address["postal_code"]).strip()[:32], shipping_method=f"Indicative estimate · {band} kg",
+            shipping_snapshot=json.dumps(snapshot), shipping_acknowledged_at=datetime.now(timezone.utc),
             payment_method=payment_method, payment_status="unpaid", status="pending",
             subtotal=subtotal, shipping=shipping, total=subtotal + shipping,
         )
@@ -343,6 +376,7 @@ def create_app(test_config=None):
             ))
             product.stock -= quantity
         db.session.add(order)
+        order.shipping_reconciliation = ShippingReconciliation(order_id=order.id, quoted_usd=shipping, status="awaiting_final_cost")
         return order
 
     def release_order_stock(order):
@@ -395,6 +429,123 @@ def create_app(test_config=None):
         if not row:
             return error("Product not found", 404)
         return jsonify(item=row.to_dict())
+
+    @app.get("/api/shipping/destinations")
+    def shipping_destinations():
+        from pycountry import countries
+        return jsonify(items=[{"code": c.alpha_2, "name": c.name} for c in countries])
+
+    @app.post("/api/shipping/estimate")
+    def shipping_estimate():
+        payload = request.get_json(silent=True) or {}
+        country_code = str(payload.get("country_code", "")).strip().upper()
+        from pycountry import countries
+        country = countries.get(alpha_2=country_code)
+        if not country:
+            return error("Choose a supported destination country", 400)
+        lines = payload.get("items")
+        if not isinstance(lines, list) or not lines or len(lines) > 100:
+            return error("Cart items are required to estimate shipping", 400)
+        try:
+            quantities = {}
+            for item in lines:
+                product_id, quantity = int(item["product_id"]), int(item["quantity"])
+                if not 1 <= quantity <= 99:
+                    raise ValueError
+                quantities[product_id] = quantities.get(product_id, 0) + quantity
+            products = {p.id: p for p in Product.query.filter(Product.id.in_(quantities), Product.is_active.is_(True)).all()}
+            if set(products) != set(quantities):
+                return error("A cart item is no longer available", 409)
+            actual = Decimal("0")
+            for product_id, quantity in quantities.items():
+                if products[product_id].weight_kg is None or Decimal(products[product_id].weight_kg) <= 0:
+                    return jsonify(status="manual_review", reason=f"Shipping weight is missing for {products[product_id].name}; contact support for a quote"), 200
+                actual += Decimal(products[product_id].weight_kg) * quantity
+            band = billable_weight(actual)
+        except (KeyError, TypeError, ValueError, InvalidOperation):
+            return error("Invalid cart quantities or product weights", 400)
+        row = ShippingEstimate.query.filter_by(country_code=country_code, weight_kg=band).first()
+        if not row or not estimate_is_current(row):
+            return jsonify(status="manual_review", country_code=country_code, country_name=country.name,
+                           actual_weight_kg=str(actual), billable_weight_kg=str(band),
+                           reason="No current source-backed estimate is available; contact support for a manual quote"), 200
+        return jsonify(status="available", estimate_id=row.id, country_code=country_code, country_name=country.name,
+                       actual_weight_kg=str(actual), billable_weight_kg=str(band), price_usd=str(row.price_usd), currency="USD",
+                       confidence=row.confidence, sources=safe_sources(row.sources), researched_at=row.researched_at.isoformat() if row.researched_at else None,
+                       expires_at=row.expires_at.isoformat() if row.expires_at else None,
+                       disclaimer="Indicative estimate only. Carrier charges can vary; no additional amount is charged without your approval.")
+
+    @app.get("/api/admin/shipping")
+    @admin_required
+    def admin_shipping():
+        rows = ShippingEstimate.query.order_by(ShippingEstimate.country_name, ShippingEstimate.weight_kg).limit(5000).all()
+        jobs = ShippingRefreshJob.query.order_by(ShippingRefreshJob.started_at.desc()).limit(20).all()
+        return jsonify(estimates=[{"id": r.id, "country_code": r.country_code, "country_name": r.country_name,
+                                   "weight_kg": str(r.weight_kg), "price_usd": str(r.price_usd) if r.price_usd is not None else None,
+                                   "status": r.status, "confidence": r.confidence, "sources": safe_sources(r.sources),
+                                   "fx_snapshot": json.loads(r.fx_snapshot) if r.fx_snapshot else None,
+                                   "notes": r.notes, "researched_at": r.researched_at.isoformat() if r.researched_at else None,
+                                   "expires_at": r.expires_at.isoformat() if r.expires_at else None, "manual_override": r.manual_override,
+                                   "current": estimate_is_current(r)} for r in rows],
+                       jobs=[{"id": j.id, "status": j.status, "attempted": j.attempted, "succeeded": j.succeeded,
+                              "failed": j.failed, "message": j.message, "started_at": j.started_at.isoformat(),
+                              "finished_at": j.finished_at.isoformat() if j.finished_at else None} for j in jobs])
+
+    @app.get("/api/admin/shipping/<int:estimate_id>/history")
+    @admin_required
+    def admin_shipping_history(estimate_id):
+        if not db.session.get(ShippingEstimate, estimate_id):
+            return error("Shipping estimate not found", 404)
+        rows = ShippingEstimateHistory.query.filter_by(estimate_id=estimate_id).order_by(ShippingEstimateHistory.created_at.desc()).limit(50).all()
+        return jsonify(items=[{"snapshot": json.loads(row.snapshot), "created_at": row.created_at.isoformat()} for row in rows])
+
+    @app.post("/api/admin/shipping/refresh")
+    @admin_required
+    def admin_shipping_refresh():
+        payload = request.get_json(silent=True) or {}
+        code = str(payload.get("country_code", "")).strip().upper()
+        if code:
+            from pycountry import countries
+            if not countries.get(alpha_2=code):
+                return error("Unsupported country code", 400)
+        try:
+            job = refresh_destinations([code] if code else None, maximum=1 if code else None)
+            return jsonify(job_id=job.id, status=job.status, attempted=job.attempted,
+                           succeeded=job.succeeded, failed=job.failed, message=job.message), 200
+        except Exception as exc:
+            db.session.rollback()
+            app.logger.exception("Shipping estimate refresh failed")
+            return error("Shipping estimate refresh failed: " + str(exc)[:240], 502)
+
+    @app.put("/api/admin/shipping/override")
+    @admin_required
+    def admin_shipping_override():
+        payload = request.get_json(silent=True) or {}
+        from pycountry import countries
+        code = str(payload.get("country_code", "")).strip().upper()
+        country = countries.get(alpha_2=code)
+        try:
+            band = Decimal(str(payload.get("weight_kg")))
+            price = Decimal(str(payload.get("price_usd"))).quantize(Decimal("0.01"))
+            if not country or band < Decimal("0.5") or band % Decimal("0.5") or price < 0 or price > Decimal("100000"):
+                raise ValueError
+        except (InvalidOperation, TypeError, ValueError):
+            return error("Provide a valid country, 0.5 kg weight band, and USD price", 400)
+        source_url = str(payload.get("source_url", "")).strip()
+        sources = safe_sources(json.dumps([{"url": source_url, "title": "Manually reviewed source"}])) if source_url else []
+        if source_url and not sources:
+            return error("Manual source must be an HTTPS URL", 400)
+        row = ShippingEstimate.query.filter_by(country_code=code, weight_kg=band).first()
+        if row:
+            db.session.add(ShippingEstimateHistory(estimate_id=row.id, snapshot=json.dumps({"price_usd": str(row.price_usd) if row.price_usd is not None else None, "status": row.status, "sources": row.sources, "researched_at": row.researched_at.isoformat() if row.researched_at else None})))
+        else:
+            row = ShippingEstimate(country_code=code, weight_kg=band)
+            db.session.add(row)
+        row.country_name, row.price_usd, row.status = country.name, price, "available"
+        row.confidence, row.sources, row.fx_snapshot, row.notes = "manual", json.dumps(sources), json.dumps({"currency":"USD","rate":"1","date":datetime.now(timezone.utc).date().isoformat()}), str(payload.get("notes", ""))[:1000]
+        row.researched_at, row.expires_at, row.manual_override = datetime.now(timezone.utc), datetime.now(timezone.utc) + timedelta(days=365), True
+        db.session.commit()
+        return jsonify(id=row.id, country_code=code, weight_kg=str(band), price_usd=str(price), status=row.status, manual_override=True)
 
     @app.post("/api/orders")
     def create_order():
@@ -759,6 +910,108 @@ def create_app(test_config=None):
         rows = Order.query.order_by(Order.created_at.desc()).limit(500).all()
         return jsonify(items=[row.to_dict() for row in rows], count=len(rows))
 
+    @app.put("/api/admin/orders/<order_id>/shipping-reconciliation")
+    @admin_required
+    def set_shipping_reconciliation(order_id):
+        order = db.session.get(Order, order_id)
+        if not order:
+            return error("Order not found", 404)
+        payload = request.get_json(silent=True) or {}
+        try:
+            final_cost = Decimal(str(payload.get("final_usd"))).quantize(Decimal("0.01"))
+            if not final_cost.is_finite() or final_cost < 0 or final_cost > Decimal("100000"):
+                raise ValueError
+        except (InvalidOperation, ValueError, TypeError):
+            return error("Enter the carrier's final cost in USD", 400)
+        reconciliation = order.shipping_reconciliation
+        if not reconciliation:
+            reconciliation = ShippingReconciliation(order_id=order.id, quoted_usd=order.shipping)
+            db.session.add(reconciliation)
+        difference = (final_cost - Decimal(reconciliation.quoted_usd)).quantize(Decimal("0.01"))
+        reconciliation.final_usd = final_cost
+        reconciliation.difference_usd = difference
+        reconciliation.reason = str(payload.get("reason", ""))[:1000]
+        approval_url = None
+        if difference > 0:
+            token = secrets.token_urlsafe(32)
+            reconciliation.approval_token_hash = hashlib.sha256(token.encode()).hexdigest()
+            reconciliation.approval_expires_at = datetime.now(timezone.utc) + timedelta(days=30)
+            reconciliation.customer_decision = None
+            reconciliation.status = "awaiting_customer_approval"
+            base = os.getenv("FRONTEND_URL", "https://buxinstore.github.io/store").rstrip("/")
+            approval_url = base + "/?shipping_adjustment=" + token
+        elif difference < 0:
+            reconciliation.approval_token_hash = None
+            reconciliation.approval_expires_at = None
+            reconciliation.status = "refund_due"
+        else:
+            reconciliation.approval_token_hash = None
+            reconciliation.approval_expires_at = None
+            reconciliation.status = "resolved"
+            reconciliation.resolved_at = datetime.now(timezone.utc)
+        db.session.commit()
+        return jsonify(reconciliation=reconciliation.to_dict(), customer_approval_url=approval_url,
+                       instruction="Send the approval URL to the customer using your existing support channel. The app does not send email or take an additional payment/refund automatically.")
+
+    @app.post("/api/admin/orders/<order_id>/shipping-reconciliation/resolve")
+    @admin_required
+    def resolve_shipping_reconciliation(order_id):
+        order = db.session.get(Order, order_id)
+        reconciliation = order.shipping_reconciliation if order else None
+        if not reconciliation:
+            return error("Shipping reconciliation not found", 404)
+        payload = request.get_json(silent=True) or {}
+        resolution = str(payload.get("resolution", ""))
+        reference = str(payload.get("reference", "")).strip()[:200]
+        if not reference:
+            return error("Enter the external payment or refund reference", 400)
+        if reconciliation.status == "customer_approved_additional_due" and resolution == "additional_paid":
+            reconciliation.status = "resolved"
+        elif reconciliation.status == "refund_due" and resolution == "refund_paid":
+            reconciliation.status = "resolved"
+            reconciliation.refund_reference = reference
+        elif reconciliation.status == "resolved" and Decimal(reconciliation.difference_usd or 0) == 0:
+            pass
+        else:
+            return error("Customer approval and the corresponding external payment/refund are required first", 409)
+        reconciliation.resolved_at = datetime.now(timezone.utc)
+        db.session.commit()
+        return jsonify(reconciliation=reconciliation.to_dict())
+
+    @app.get("/api/shipping-adjustments/<token>")
+    def shipping_adjustment_details(token):
+        digest = hashlib.sha256(token.encode()).hexdigest()
+        reconciliation = ShippingReconciliation.query.filter_by(approval_token_hash=digest, status="awaiting_customer_approval").first()
+        expires = reconciliation.approval_expires_at if reconciliation else None
+        if expires and expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        if not reconciliation or not expires or expires <= datetime.now(timezone.utc):
+            return error("This shipping adjustment link is invalid or already used", 404)
+        return jsonify(order_id=reconciliation.order_id, customer_name=reconciliation.order.customer_name,
+                       quoted_usd=str(reconciliation.quoted_usd), final_usd=str(reconciliation.final_usd),
+                       additional_usd=str(reconciliation.difference_usd), reason=reconciliation.reason,
+                       currency="USD", expires_in_days=30)
+
+    @app.post("/api/shipping-adjustments/<token>")
+    def decide_shipping_adjustment(token):
+        digest = hashlib.sha256(token.encode()).hexdigest()
+        reconciliation = ShippingReconciliation.query.filter_by(approval_token_hash=digest, status="awaiting_customer_approval").with_for_update().first()
+        expires = reconciliation.approval_expires_at if reconciliation else None
+        if expires and expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        if not reconciliation or not expires or expires <= datetime.now(timezone.utc):
+            return error("This shipping adjustment link is invalid or already used", 404)
+        decision = (request.get_json(silent=True) or {}).get("approve")
+        if not isinstance(decision, bool):
+            return error("Choose approve or decline", 400)
+        reconciliation.customer_decision = "approved" if decision else "declined"
+        reconciliation.customer_decided_at = datetime.now(timezone.utc)
+        reconciliation.status = "customer_approved_additional_due" if decision else "manual_review_declined"
+        reconciliation.approval_token_hash = None
+        reconciliation.approval_expires_at = None
+        db.session.commit()
+        return jsonify(status=reconciliation.status, message="Your decision was recorded. The store will contact you about the next step.")
+
     @app.patch("/api/admin/orders/<order_id>")
     @admin_required
     def update_order(order_id):
@@ -769,6 +1022,8 @@ def create_app(test_config=None):
         status = str(payload.get("status", "")).lower()
         if status not in ALLOWED_ORDER_STATUSES:
             return error("Invalid order status", 400)
+        if status == "shipped" and (not order.shipping_reconciliation or order.shipping_reconciliation.status != "resolved"):
+            return error("Shipping cost must be reconciled and any customer-approved adjustment or refund completed before dispatch", 409)
         order.status = status
         db.session.commit()
         return jsonify(order=order.to_dict())
@@ -804,10 +1059,11 @@ def create_app(test_config=None):
             price = Decimal(str(payload.get("price", "")))
             stock = int(payload.get("stock", 0))
             category_id = int(payload.get("category_id", 0))
+            weight_kg = Decimal(str(payload["weight_kg"])) if payload.get("weight_kg") not in (None, "") else None
         except (TypeError, ValueError, InvalidOperation):
             return error("Valid name, slug, price, stock, and category_id are required", 400)
         category = db.session.get(Category, category_id)
-        if not name or not slug or price < 0 or stock < 0 or not category:
+        if not name or not slug or price < 0 or stock < 0 or not category or (weight_kg is not None and (weight_kg <= 0 or weight_kg > 1000)):
             return error("Product details or category are invalid", 400)
         if Product.query.filter_by(slug=slug).first():
             return error("Product slug already exists", 409)
@@ -821,6 +1077,7 @@ def create_app(test_config=None):
             cloudinary_public_id=payload.get("cloudinary_public_id"),
             sku=payload.get("sku"),
             stock=stock,
+            weight_kg=weight_kg,
             category=category,
             is_featured=bool(payload.get("is_featured", False)),
         )
@@ -854,15 +1111,19 @@ def create_app(test_config=None):
                 product.compare_at_price = Decimal(str(payload["compare_at_price"])) if payload["compare_at_price"] is not None else None
             if "stock" in payload:
                 product.stock = int(payload["stock"])
+            if "weight_kg" in payload:
+                product.weight_kg = Decimal(str(payload["weight_kg"])) if payload["weight_kg"] not in (None, "") else None
             if "category_id" in payload:
                 category = db.session.get(Category, int(payload["category_id"]))
                 if not category:
                     return error("Category not found", 404)
                 product.category = category
         except (TypeError, ValueError, InvalidOperation):
-            return error("Invalid price, stock, or category_id", 400)
+            return error("Invalid price, stock, weight, or category_id", 400)
         if product.price < 0 or product.stock < 0:
             return error("Price and stock cannot be negative", 400)
+        if product.weight_kg is not None and (product.weight_kg <= 0 or product.weight_kg > 1000):
+            return error("Product weight must be between 0 and 1000 kg", 400)
         db.session.commit()
         return jsonify(item=product.to_dict())
 
