@@ -83,6 +83,17 @@ def create_app(test_config=None):
             with db.engine.begin() as connection:
                 connection.execute(text("ALTER TABLE orders ALTER COLUMN address TYPE TEXT"))
                 connection.execute(text("ALTER TABLE store_settings ALTER COLUMN value TYPE TEXT"))
+        attempt_columns = {column["name"] for column in inspect(db.engine).get_columns("payment_attempts")}
+        attempt_migrations = {
+            "paypal_currency": "VARCHAR(3)",
+            "paypal_amount": "NUMERIC(12, 2)",
+            "paypal_exchange_rate": "NUMERIC(18, 8)",
+            "paypal_rate_date": "VARCHAR(40)",
+        }
+        for column, sql_type in attempt_migrations.items():
+            if column not in attempt_columns:
+                with db.engine.begin() as connection:
+                    connection.execute(text(f"ALTER TABLE payment_attempts ADD COLUMN {column} {sql_type}"))
         if Category.query.count() == 0 and Product.query.count() == 0:
             seed_starter_catalog(update_existing=False)
 
@@ -121,6 +132,53 @@ def create_app(test_config=None):
         except (TypeError, ValueError):
             return DEFAULT_SHIPPING_METHODS
         return methods if isinstance(methods, list) else DEFAULT_SHIPPING_METHODS
+
+    def paypal_conversion():
+        setting = db.session.get(StoreSetting, "paypal_gmd_usd_rate")
+        cached = None
+        if setting:
+            try:
+                cached = json.loads(setting.value)
+                updated = datetime.fromisoformat(cached["updated_at"])
+                if updated.tzinfo is None:
+                    updated = updated.replace(tzinfo=timezone.utc)
+                if (datetime.now(timezone.utc) - updated).total_seconds() < 86400:
+                    return cached
+            except (KeyError, TypeError, ValueError):
+                cached = None
+
+        req = Request("https://open.er-api.com/v6/latest/GMD", headers={"User-Agent": "ElectroHubStore/1.0"})
+        try:
+            with urlopen(req, timeout=8) as response:
+                data = json.loads(response.read().decode())
+            if not isinstance(data, dict):
+                raise ValueError("Exchange rate response was invalid")
+            rate = Decimal(str(data.get("rates", {}).get("USD", "0")))
+            if data.get("result") != "success" or data.get("base_code") != "GMD" or rate <= 0:
+                raise ValueError("Exchange rate response was invalid")
+            rate_date = str(data.get("time_last_update_utc", ""))
+            updated_at = datetime.now(timezone.utc).isoformat()
+            converted = {"currency": "USD", "gmd_to_usd": str(rate), "rate_date": rate_date, "updated_at": updated_at}
+            setting = db.session.get(StoreSetting, "paypal_gmd_usd_rate")
+            if setting:
+                setting.value = json.dumps(converted)
+            else:
+                db.session.add(StoreSetting(key="paypal_gmd_usd_rate", value=json.dumps(converted)))
+            db.session.commit()
+            return converted
+        except (HTTPError, URLError, TimeoutError, ValueError, InvalidOperation, json.JSONDecodeError):
+            db.session.rollback()
+            if cached:
+                try:
+                    updated = datetime.fromisoformat(cached["updated_at"])
+                    if updated.tzinfo is None:
+                        updated = updated.replace(tzinfo=timezone.utc)
+                    if (datetime.now(timezone.utc) - updated).total_seconds() < 172800:
+                        return cached
+                except (KeyError, TypeError, ValueError):
+                    pass
+            app.logger.exception("Could not retrieve PayPal currency conversion rate")
+            raise RuntimeError("PayPal currency conversion is temporarily unavailable")
 
     def payment_secret(provider, mode):
         if provider == "modem":
@@ -396,7 +454,14 @@ def create_app(test_config=None):
     def public_payment_config():
         mode = active_payment_mode()
         methods = [item for item in shipping_methods() if item.get("enabled", True)]
-        return jsonify(mode=mode, providers=provider_status(mode), currency=os.getenv("PAYMENT_CURRENCY", "GMD").strip().upper(), shipping_methods=methods)
+        providers = provider_status(mode)
+        conversion = None
+        if providers.get("paypal"):
+            try:
+                conversion = paypal_conversion()
+            except RuntimeError:
+                providers["paypal"] = False
+        return jsonify(mode=mode, providers=providers, currency=os.getenv("PAYMENT_CURRENCY", "GMD").strip().upper(), shipping_methods=methods, paypal_conversion=conversion)
 
     @app.post("/api/payments/checkout")
     def create_payment_checkout():
@@ -434,6 +499,8 @@ def create_app(test_config=None):
         frontend_url = frontend_url.rstrip("/")
         success_url = frontend_url + "/?payment=success&order_id=" + order.id
         cancel_url = frontend_url + "/?payment=cancelled&order_id=" + order.id
+        conversion = None
+        paypal_amount = None
         try:
             if provider == "modem":
                 secret = payment_secret("modem", mode)
@@ -455,24 +522,23 @@ def create_app(test_config=None):
                 provider_reference = payment_data.get("id") or payment_data.get("intent_secret")
                 checkout_url = payment_data.get("payment_link")
             else:
+                conversion = paypal_conversion()
+                paypal_rate = Decimal(conversion["gmd_to_usd"])
+                paypal_amount = Decimal(order.total * paypal_rate).quantize(Decimal("0.01"))
+                paypal_subtotal = Decimal(order.subtotal * paypal_rate).quantize(Decimal("0.01"))
+                paypal_shipping = paypal_amount - paypal_subtotal
                 token, api_base = paypal_access_token(mode)
-                items = [{
-                    "name": item.product_name[:127],
-                    "quantity": str(item.quantity),
-                    "unit_amount": {"currency_code": "GMD", "value": f"{Decimal(item.unit_price):.2f}"},
-                } for item in order.items]
                 purchase_unit = {
                     "reference_id": order.id,
                     "custom_id": order.id,
                     "amount": {
-                        "currency_code": "GMD",
-                        "value": f"{order.total:.2f}",
+                        "currency_code": "USD",
+                        "value": f"{paypal_amount:.2f}",
                         "breakdown": {
-                            "item_total": {"currency_code": "GMD", "value": f"{order.subtotal:.2f}"},
-                            **({"shipping": {"currency_code": "GMD", "value": f"{order.shipping:.2f}"}} if order.shipping else {}),
+                            "item_total": {"currency_code": "USD", "value": f"{paypal_subtotal:.2f}"},
+                            "shipping": {"currency_code": "USD", "value": f"{paypal_shipping:.2f}"},
                         },
                     },
-                    "items": items,
                 }
                 result = provider_request(api_base + "/v2/checkout/orders", {
                     "intent": "CAPTURE", "purchase_units": [purchase_unit],
@@ -486,6 +552,9 @@ def create_app(test_config=None):
             db.session.add(PaymentAttempt(
                 order_id=order.id, provider=provider, provider_reference=provider_reference,
                 mode=mode, status="pending", frontend_url=frontend_url,
+                paypal_currency="USD" if conversion else None, paypal_amount=paypal_amount,
+                paypal_exchange_rate=Decimal(conversion["gmd_to_usd"]) if conversion else None,
+                paypal_rate_date=conversion["rate_date"][:40] if conversion else None,
             ))
             db.session.commit()
             return jsonify(order_id=order.id, checkout_url=checkout_url, mode=mode), 201
@@ -505,7 +574,10 @@ def create_app(test_config=None):
         order = db.session.get(Order, order_id)
         if not order:
             return error("Order not found", 404)
-        return jsonify(order_id=order.id, payment_status=order.payment_status, status=order.status, total=float(order.total))
+        attempt = PaymentAttempt.query.filter_by(order_id=order.id, status="paid").first()
+        return jsonify(order_id=order.id, payment_status=order.payment_status, status=order.status, total=float(order.total),
+                       payment_currency=attempt.paypal_currency if attempt else "GMD",
+                       payment_amount=float(attempt.paypal_amount) if attempt and attempt.paypal_amount is not None else float(order.total))
 
     @app.post("/api/payments/modem/webhook")
     def modem_webhook():
@@ -566,7 +638,10 @@ def create_app(test_config=None):
             })
             captures = [c for unit in capture.get("purchase_units", []) for c in unit.get("payments", {}).get("captures", [])]
             paid_amount = sum((Decimal(c.get("amount", {}).get("value", "0")) for c in captures if c.get("status") == "COMPLETED"), Decimal("0.00"))
-            if capture.get("status") != "COMPLETED" or paid_amount != Decimal(order.total):
+            expected_currency = attempt.paypal_currency or "GMD"
+            expected_amount = Decimal(attempt.paypal_amount if attempt.paypal_amount is not None else order.total)
+            capture_currency = next((c.get("amount", {}).get("currency_code") for c in captures if c.get("status") == "COMPLETED"), None)
+            if capture.get("status") != "COMPLETED" or paid_amount != expected_amount or capture_currency != expected_currency:
                 raise RuntimeError("PayPal capture could not be verified")
             order.payment_status = "paid"
             order.status = "processing"

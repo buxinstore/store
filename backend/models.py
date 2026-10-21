@@ -177,4 +177,8 @@ class PaymentAttempt(db.Model):
     mode = db.Column(db.String(10), nullable=False)
     status = db.Column(db.String(30), nullable=False, default="pending")
     frontend_url = db.Column(db.String(1000), nullable=False)
+    paypal_currency = db.Column(db.String(3))
+    paypal_amount = db.Column(Numeric(12, 2))
+    paypal_exchange_rate = db.Column(Numeric(18, 8))
+    paypal_rate_date = db.Column(db.String(40))
     order = db.relationship("Order", lazy="joined")
