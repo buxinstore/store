@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timezone
 from decimal import Decimal
 from uuid import uuid4
@@ -96,9 +97,10 @@ class Order(db.Model):
     id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid4()))
     customer_name = db.Column(db.String(180), nullable=False)
     email = db.Column(db.String(254), nullable=False, index=True)
-    address = db.Column(db.String(300), nullable=False)
+    address = db.Column(db.Text, nullable=False)
     city = db.Column(db.String(120), nullable=False)
     postal_code = db.Column(db.String(32), nullable=False)
+    shipping_method = db.Column(db.String(120), nullable=False, default="standard")
     payment_method = db.Column(db.String(50), nullable=False)
     payment_status = db.Column(db.String(40), nullable=False, default="unpaid")
     status = db.Column(db.String(40), nullable=False, default="pending")
@@ -109,15 +111,18 @@ class Order(db.Model):
     items = db.relationship("OrderItem", back_populates="order", cascade="all, delete-orphan", lazy="selectin")
 
     def to_dict(self):
+        try:
+            shipping_address = json.loads(self.address)
+            if not isinstance(shipping_address, dict):
+                raise ValueError
+        except (TypeError, ValueError):
+            shipping_address = {"address": self.address, "city": self.city, "postal_code": self.postal_code}
         return {
             "id": self.id,
             "customer_name": self.customer_name,
             "email": self.email,
-            "shipping_address": {
-                "address": self.address,
-                "city": self.city,
-                "postal_code": self.postal_code,
-            },
+            "shipping_address": shipping_address,
+            "shipping_method": getattr(self, "shipping_method", ""),
             "payment_method": self.payment_method,
             "payment_status": self.payment_status,
             "status": self.status,
@@ -159,7 +164,7 @@ class StoreSetting(db.Model):
     __tablename__ = "store_settings"
 
     key = db.Column(db.String(80), primary_key=True)
-    value = db.Column(db.String(200), nullable=False)
+    value = db.Column(db.Text, nullable=False)
 
 
 class PaymentAttempt(db.Model):

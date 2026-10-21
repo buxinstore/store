@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 from flask import Flask, jsonify, redirect, request
 from flask_cors import CORS
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
-from sqlalchemy import text
+from sqlalchemy import inspect, text
 from sqlalchemy.exc import SQLAlchemyError
 from werkzeug.exceptions import RequestEntityTooLarge
 
@@ -30,6 +30,11 @@ ALLOWED_ORDER_STATUSES = {"pending", "processing", "shipped", "completed", "canc
 PAYMENT_MODES = {"test", "live"}
 PAYMENT_PROVIDERS = {"modem", "paypal"}
 ONLINE_PAYMENT_MESSAGE = "Online payments are not configured for the selected payment mode."
+DEFAULT_SHIPPING_METHODS = [
+    {"id": "dhl", "name": "DHL", "price": "4.99", "enabled": True},
+    {"id": "fedex", "name": "FedEx", "price": "4.99", "enabled": True},
+    {"id": "community", "name": "Community courier", "price": "4.99", "enabled": True},
+]
 
 
 def database_uri():
@@ -68,6 +73,15 @@ def create_app(test_config=None):
 
     with app.app_context():
         db.create_all()
+        # Additive, safe upgrades for databases created by earlier storefront versions.
+        columns = {column["name"] for column in inspect(db.engine).get_columns("orders")}
+        if "shipping_method" not in columns:
+            with db.engine.begin() as connection:
+                connection.execute(text("ALTER TABLE orders ADD COLUMN shipping_method VARCHAR(120) NOT NULL DEFAULT 'standard'"))
+        if db.engine.dialect.name == "postgresql":
+            with db.engine.begin() as connection:
+                connection.execute(text("ALTER TABLE orders ALTER COLUMN address TYPE TEXT"))
+                connection.execute(text("ALTER TABLE store_settings ALTER COLUMN value TYPE TEXT"))
 
     def admin_required(fn):
         @wraps(fn)
@@ -94,6 +108,16 @@ def create_app(test_config=None):
     def active_payment_mode():
         setting = db.session.get(StoreSetting, "payment_mode")
         return setting.value if setting and setting.value in PAYMENT_MODES else "test"
+
+    def shipping_methods():
+        setting = db.session.get(StoreSetting, "shipping_methods")
+        if not setting:
+            return DEFAULT_SHIPPING_METHODS
+        try:
+            methods = json.loads(setting.value)
+        except (TypeError, ValueError):
+            return DEFAULT_SHIPPING_METHODS
+        return methods if isinstance(methods, list) else DEFAULT_SHIPPING_METHODS
 
     def payment_secret(provider, mode):
         if provider == "modem":
@@ -179,9 +203,24 @@ def create_app(test_config=None):
         return token, base
 
     def build_order(payload, payment_method):
-        required = ("customer_name", "email", "address", "city", "postal_code")
-        if any(not str(payload.get(field, "")).strip() for field in required):
-            raise ValueError("Customer name, email, and shipping address are required")
+        address = payload.get("shipping_address")
+        if not isinstance(address, dict):
+            address = {"address": payload.get("address"), "city": payload.get("city"), "postal_code": payload.get("postal_code")}
+        required = ("customer_name", "email")
+        if any(not str(payload.get(field, "")).strip() for field in required) or any(
+            not str(address.get(field, "")).strip() for field in ("address", "city", "region", "postal_code", "country", "phone")
+        ):
+            raise ValueError("Enter your name, email, phone, and complete delivery address")
+        selected_method = str(payload.get("shipping_method", "")).strip()
+        method = next((item for item in shipping_methods() if item.get("id") == selected_method and item.get("enabled", True)), None)
+        if not method:
+            raise ValueError("Choose an available shipping method")
+        try:
+            shipping = Decimal(str(method.get("price", ""))).quantize(Decimal("0.01"))
+        except (InvalidOperation, ValueError):
+            raise ValueError("The selected shipping method has an invalid price")
+        if not shipping.is_finite() or shipping < 0 or shipping > Decimal("100000"):
+            raise ValueError("The selected shipping method has an invalid price")
         lines = payload.get("items")
         if not isinstance(lines, list) or not lines or len(lines) > 100:
             raise ValueError("Order must include between 1 and 100 items")
@@ -210,11 +249,10 @@ def create_app(test_config=None):
                 raise ArithmeticError(f"Insufficient stock for {product.name}")
             subtotal += Decimal(product.price) * quantity
             order_lines.append((product, quantity))
-        shipping = Decimal("0.00") if subtotal >= Decimal("50.00") else Decimal("4.99")
         order = Order(
             id=str(uuid4()), customer_name=str(payload["customer_name"]).strip()[:180],
-            email=str(payload["email"]).strip()[:254], address=str(payload["address"]).strip()[:300],
-            city=str(payload["city"]).strip()[:120], postal_code=str(payload["postal_code"]).strip()[:32],
+            email=str(payload["email"]).strip()[:254], address=json.dumps({key: str(value).strip() for key, value in address.items()}, ensure_ascii=False),
+            city=str(address["city"]).strip()[:120], postal_code=str(address["postal_code"]).strip()[:32], shipping_method=method["name"],
             payment_method=payment_method, payment_status="unpaid", status="pending",
             subtotal=subtotal, shipping=shipping, total=subtotal + shipping,
         )
@@ -354,7 +392,8 @@ def create_app(test_config=None):
     @app.get("/api/payments/config")
     def public_payment_config():
         mode = active_payment_mode()
-        return jsonify(mode=mode, providers=provider_status(mode), currency=os.getenv("PAYMENT_CURRENCY", "GMD").strip().upper(), free_shipping_threshold=50, shipping_fee=4.99)
+        methods = [item for item in shipping_methods() if item.get("enabled", True)]
+        return jsonify(mode=mode, providers=provider_status(mode), currency=os.getenv("PAYMENT_CURRENCY", "GMD").strip().upper(), shipping_methods=methods)
 
     @app.post("/api/payments/checkout")
     def create_payment_checkout():
@@ -564,12 +603,40 @@ def create_app(test_config=None):
     @app.get("/api/admin/payment-settings")
     @admin_required
     def admin_payment_settings():
-        return jsonify(mode=active_payment_mode(), providers={mode: provider_status(mode) for mode in PAYMENT_MODES})
+        return jsonify(mode=active_payment_mode(), providers={mode: provider_status(mode) for mode in PAYMENT_MODES}, shipping_methods=shipping_methods())
 
     @app.put("/api/admin/payment-settings")
     @admin_required
     def update_admin_payment_settings():
         payload = request.get_json(silent=True) or {}
+        if "shipping_methods" in payload:
+            submitted = payload.get("shipping_methods")
+            if not isinstance(submitted, list) or not submitted or len(submitted) > 10:
+                return error("Add between 1 and 10 shipping methods", 400)
+            methods, ids = [], set()
+            for item in submitted:
+                if not isinstance(item, dict):
+                    return error("Each shipping method must have a name and price", 400)
+                name = str(item.get("name", "")).strip()[:80]
+                method_id = str(item.get("id", "")).strip().lower()[:40]
+                try:
+                    price = Decimal(str(item.get("price", ""))).quantize(Decimal("0.01"))
+                except (InvalidOperation, ValueError):
+                    return error("Shipping prices must be valid numbers", 400)
+                if not name or not method_id or not method_id.replace("-", "").replace("_", "").isalnum() or method_id in ids:
+                    return error("Shipping method names and IDs must be valid and unique", 400)
+                if not price.is_finite() or price < 0 or price > Decimal("100000"):
+                    return error("Shipping prices must be between GMD 0 and GMD 100,000", 400)
+                ids.add(method_id)
+                methods.append({"id": method_id, "name": name, "price": f"{price:.2f}", "enabled": bool(item.get("enabled", True))})
+            setting = db.session.get(StoreSetting, "shipping_methods")
+            if setting:
+                setting.value = json.dumps(methods)
+            else:
+                db.session.add(StoreSetting(key="shipping_methods", value=json.dumps(methods)))
+            db.session.commit()
+            if "mode" not in payload:
+                return jsonify(mode=active_payment_mode(), providers={mode: provider_status(mode) for mode in PAYMENT_MODES}, shipping_methods=methods)
         mode = str(payload.get("mode", "")).strip().lower()
         if mode not in PAYMENT_MODES:
             return error("Payment mode must be test or live", 400)
@@ -582,7 +649,7 @@ def create_app(test_config=None):
         else:
             db.session.add(StoreSetting(key="payment_mode", value=mode))
         db.session.commit()
-        return jsonify(mode=mode, providers={candidate: provider_status(candidate) for candidate in PAYMENT_MODES})
+        return jsonify(mode=mode, providers={candidate: provider_status(candidate) for candidate in PAYMENT_MODES}, shipping_methods=shipping_methods())
 
     @app.get("/api/admin/orders")
     @admin_required
