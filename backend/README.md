@@ -46,6 +46,7 @@ The repository-root `render.yaml` describes the API web service. Deploy it as a 
 - `ADMIN_USERNAME` and `ADMIN_PASSWORD`: private admin credentials.
 - `FRONTEND_ORIGINS`: your GitHub Pages origin, such as `https://your-user.github.io` (origin only; no repository path).
 - `FRONTEND_URL`: the full storefront base URL, including the GitHub Pages repository path when applicable (for example, `https://your-user.github.io/store`).
+- `MODEM_PUBLIC_KEY` for the Modem Pay dashboard public key. The current server-to-server integration does not use it.
 - `MODEM_TEST_SECRET` and `MODEM_TEST_WEBHOOK_SECRET` for Modem Pay test mode; set the webhook endpoint to `/api/payments/modem/webhook`.
 - `MODEM_LIVE_SECRET` and `MODEM_WEBHOOK_SECRET` for Modem Pay live mode. Set `PAYMENT_CURRENCY=USD`; storefront prices and order totals use USD, while Modem Pay checkout converts the final amount to GMD.
 - `PAYPAL_SANDBOX_CLIENT_ID` and `PAYPAL_SANDBOX_SECRET` for PayPal sandbox; `PAYPAL_LIVE_CLIENT_ID` and `PAYPAL_LIVE_SECRET` for production.

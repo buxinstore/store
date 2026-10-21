@@ -22,6 +22,8 @@ services:
         sync: false
       - key: FRONTEND_URL
         sync: false
+      - key: MODEM_PUBLIC_KEY
+        sync: false
       - key: MODEM_TEST_SECRET
         sync: false
       - key: MODEM_TEST_WEBHOOK_SECRET
