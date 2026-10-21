@@ -23,6 +23,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from werkzeug.exceptions import RequestEntityTooLarge
 
 from models import Category, Order, OrderItem, PaymentAttempt, Product, StoreSetting, db
+from catalog_seed import seed_starter_catalog
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
@@ -82,6 +83,8 @@ def create_app(test_config=None):
             with db.engine.begin() as connection:
                 connection.execute(text("ALTER TABLE orders ALTER COLUMN address TYPE TEXT"))
                 connection.execute(text("ALTER TABLE store_settings ALTER COLUMN value TYPE TEXT"))
+        if Category.query.count() == 0 and Product.query.count() == 0:
+            seed_starter_catalog(update_existing=False)
 
     def admin_required(fn):
         @wraps(fn)
