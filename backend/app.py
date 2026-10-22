@@ -101,6 +101,10 @@ def create_app(test_config=None):
             for setting in obsolete_groq_settings:
                 db.session.delete(setting)
             db.session.commit()
+        else:
+            # Release the read transaction before schema migrations. Neon pooler
+            # sessions can terminate connections left idle inside a transaction.
+            db.session.rollback()
         # Additive, safe upgrades for databases created by earlier storefront versions.
         columns = {column["name"] for column in inspect(db.engine).get_columns("orders")}
         if "shipping_method" not in columns:
