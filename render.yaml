@@ -5,7 +5,7 @@ services:
     rootDir: backend
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn --log-level info --access-logfile - --error-logfile - --bind 0.0.0.0:$PORT app:app
+    startCommand: gunicorn --timeout 180 --log-level info --access-logfile - --error-logfile - --bind 0.0.0.0:$PORT app:app
     healthCheckPath: /api/health
     envVars:
       - key: DATABASE_URL
@@ -44,10 +44,8 @@ services:
         sync: false
       - key: ENABLE_LIVE_PAYMENTS
         value: "false"
-      - key: XAI_API_KEY
+      - key: GROQ_API_KEY
         sync: false
-      - key: XAI_MODEL
-        value: grok-4.7
       - key: SHIPPING_ESTIMATE_MAX_DESTINATIONS_PER_RUN
         value: "10"
       - key: SHIPPING_ESTIMATE_MAX_AGE_DAYS
@@ -65,10 +63,8 @@ services:
     envVars:
       - key: DATABASE_URL
         sync: false
-      - key: XAI_API_KEY
+      - key: GROQ_API_KEY
         sync: false
-      - key: XAI_MODEL
-        value: grok-4.7
       - key: SHIPPING_ESTIMATE_MAX_DESTINATIONS_PER_RUN
         value: "10"
       - key: SHIPPING_ESTIMATE_MAX_AGE_DAYS
