@@ -13,6 +13,8 @@ from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 from uuid import uuid4
 
+from cryptography.fernet import Fernet, InvalidToken
+
 import cloudinary
 import cloudinary.uploader
 from dotenv import load_dotenv
@@ -144,6 +146,21 @@ def create_app(test_config=None):
     def active_payment_mode():
         setting = db.session.get(StoreSetting, "payment_mode")
         return setting.value if setting and setting.value in PAYMENT_MODES else "test"
+
+    def groq_cipher():
+        secret = str(app.config["SECRET_KEY"]).encode("utf-8")
+        key = base64.urlsafe_b64encode(hashlib.sha256(b"electrohub-groq-key-v1:" + secret).digest())
+        return Fernet(key)
+
+    def get_groq_key():
+        setting = db.session.get(StoreSetting, "groq_api_key_encrypted")
+        if setting:
+            try:
+                return groq_cipher().decrypt(setting.value.encode("utf-8")).decode("utf-8"), "admin"
+            except (InvalidToken, ValueError, UnicodeDecodeError):
+                app.logger.error("Stored Groq key cannot be decrypted; check that SECRET_KEY has not changed")
+                return "", "admin"
+        return os.getenv("GROQ_API_KEY", "").strip(), "environment"
 
     def shipping_methods():
         setting = db.session.get(StoreSetting, "shipping_methods")
@@ -852,6 +869,77 @@ def create_app(test_config=None):
             {"sub": configured_user}
         )
         return jsonify(token=token, expires_in=app.config["ADMIN_TOKEN_TTL_SECONDS"])
+
+    @app.get("/api/admin/ai/settings")
+    @admin_required
+    def admin_ai_settings():
+        key, source = get_groq_key()
+        return jsonify(configured=bool(key), source=source if key else None,
+                       model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"))
+
+    @app.put("/api/admin/ai/settings")
+    @admin_required
+    def update_admin_ai_settings():
+        payload = request.get_json(silent=True) or {}
+        if "api_key" not in payload or not isinstance(payload["api_key"], str):
+            return error("Enter a Groq API key", 400)
+        api_key = payload["api_key"].strip()
+        setting = db.session.get(StoreSetting, "groq_api_key_encrypted")
+        if not api_key:
+            if setting:
+                db.session.delete(setting)
+                db.session.commit()
+            key, source = get_groq_key()
+            return jsonify(configured=bool(key), source=source if key else None,
+                           message="Saved key cleared; environment key is used if configured.")
+        if len(api_key) > 512 or any(char.isspace() for char in api_key):
+            return error("The Groq API key format is invalid", 400)
+        encrypted = groq_cipher().encrypt(api_key.encode("utf-8")).decode("utf-8")
+        if setting:
+            setting.value = encrypted
+        else:
+            db.session.add(StoreSetting(key="groq_api_key_encrypted", value=encrypted))
+        db.session.commit()
+        return jsonify(configured=True, source="admin", message="Groq API key saved securely.")
+
+    @app.post("/api/admin/ai/test")
+    @admin_required
+    def test_admin_groq_chat():
+        payload = request.get_json(silent=True) or {}
+        message = payload.get("message")
+        if not isinstance(message, str) or not message.strip() or len(message) > 2000:
+            return error("Enter a message between 1 and 2,000 characters", 400)
+        api_key, _ = get_groq_key()
+        if not api_key:
+            return error("Save a Groq API key or set GROQ_API_KEY on the server first", 409)
+        model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip()
+        body = json.dumps({
+            "model": model,
+            "messages": [{"role": "user", "content": message.strip()}],
+            "max_tokens": 400,
+            "temperature": 0.7,
+        }).encode("utf-8")
+        req = Request("https://api.groq.com/openai/v1/chat/completions", data=body,
+                      headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
+        try:
+            with urlopen(req, timeout=30) as response:
+                result = json.loads(response.read().decode("utf-8"))
+            reply = result["choices"][0]["message"]["content"]
+            if not isinstance(reply, str) or not reply.strip():
+                raise ValueError("Empty chat response")
+            return jsonify(reply=reply, model=model)
+        except HTTPError as exc:
+            app.logger.warning("Groq chat request failed with HTTP %s", exc.code)
+            if exc.code == 401:
+                return error("Groq rejected the API key. Check the key and try again.", 502)
+            if exc.code == 429:
+                return error("Groq rate limit or quota reached. Try again later.", 503)
+            return error(f"Groq could not complete the test (HTTP {exc.code})", 502)
+        except (URLError, TimeoutError):
+            return error("Could not connect to Groq. Try again shortly.", 502)
+        except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError):
+            app.logger.warning("Groq returned an invalid chat response")
+            return error("Groq returned an invalid response. Check the selected model and try again.", 502)
 
     @app.get("/api/admin/payment-settings")
     @admin_required
