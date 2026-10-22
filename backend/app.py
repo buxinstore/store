@@ -26,8 +26,7 @@ from werkzeug.exceptions import RequestEntityTooLarge
 
 from models import Category, Order, OrderItem, PaymentAttempt, Product, StoreSetting, ShippingEstimate, ShippingEstimateHistory, ShippingRate, ShippingRateHistory, ShippingRefreshJob, ShippingReconciliation, db
 from catalog_seed import seed_starter_catalog
-from shipping import refresh_destinations
-from shipping_core import billable_weight, estimate_is_current, shipping_charge, shipping_rate_is_current, safe_sources
+from shipping_core import billable_weight, estimate_is_current, missing_provider_rate_pairs, shipping_charge, shipping_rate_is_current, safe_sources
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
@@ -98,11 +97,11 @@ def create_app(test_config=None):
         # unresearched rows stay explicitly in manual review with no price.
         from pycountry import countries
         present_rates = set(db.session.query(ShippingRate.country_code, ShippingRate.provider).all())
-        for destination in countries:
-            for provider_id in ("dhl", "fedex", "community"):
-                if (destination.alpha_2, provider_id) not in present_rates:
-                    db.session.add(ShippingRate(country_code=destination.alpha_2, country_name=destination.name,
-                        provider=provider_id, status="manual_review"))
+        country_names = {destination.alpha_2: destination.name for destination in countries}
+        missing_pairs = missing_provider_rate_pairs(country_names, present_rates)
+        for country_code, provider_id in missing_pairs:
+            db.session.add(ShippingRate(country_code=country_code, country_name=country_names[country_code],
+                provider=provider_id, status="manual_review"))
         db.session.commit()
         # AI credentials now come only from the server environment.
         obsolete_groq_settings = [db.session.get(StoreSetting, key)
@@ -136,6 +135,21 @@ def create_app(test_config=None):
         if "shipping_acknowledged_at" not in order_columns:
             with db.engine.begin() as connection:
                 connection.execute(text("ALTER TABLE orders ADD COLUMN shipping_acknowledged_at TIMESTAMP WITH TIME ZONE"))
+        rate_columns = {column["name"] for column in inspect(db.engine).get_columns("shipping_rates")}
+        if "evidence" not in rate_columns:
+            with db.engine.begin() as connection:
+                connection.execute(text("ALTER TABLE shipping_rates ADD COLUMN evidence TEXT"))
+        job_columns = {column["name"] for column in inspect(db.engine).get_columns("shipping_refresh_jobs")}
+        job_migrations = {
+            "tokens_used": "INTEGER NOT NULL DEFAULT 0",
+            "rate_limit_remaining": "VARCHAR(40)",
+            "current_destination": "VARCHAR(2)",
+            "pending": "INTEGER NOT NULL DEFAULT 0",
+        }
+        for column, sql_type in job_migrations.items():
+            if column not in job_columns:
+                with db.engine.begin() as connection:
+                    connection.execute(text(f"ALTER TABLE shipping_refresh_jobs ADD COLUMN {column} {sql_type}"))
         if db.engine.dialect.name == "postgresql":
             with db.engine.begin() as connection:
                 connection.execute(text("ALTER TABLE orders ALTER COLUMN address TYPE TEXT"))
@@ -535,18 +549,45 @@ def create_app(test_config=None):
     @app.get("/api/admin/shipping")
     @admin_required
     def admin_shipping():
+        from pycountry import countries
         rows = ShippingRate.query.order_by(ShippingRate.country_name, ShippingRate.provider).all()
         jobs = ShippingRefreshJob.query.order_by(ShippingRefreshJob.started_at.desc()).limit(20).all()
-        return jsonify(rates=[{"id": r.id, "country_code": r.country_code, "country_name": r.country_name,
+        rate_lookup = {(r.country_code, r.provider): r for r in rows}
+        freshness_days = max(1, int(os.getenv("SHIPPING_ESTIMATE_MAX_AGE_DAYS", "30")))
+        cutoff = datetime.now(timezone.utc) - timedelta(days=freshness_days)
+        def reviewed(code, provider):
+            rate = rate_lookup.get((code, provider))
+            if rate and rate.status == "stale":
+                return False
+            stamp = rate.researched_at if rate else None
+            if stamp and stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=timezone.utc)
+            return bool(rate and (rate.manual_override or (stamp and stamp >= cutoff)))
+        total_destinations = len(list(countries))
+        reviewed_destinations = sum(1 for country in countries if all(reviewed(country.alpha_2, p) for p in ("dhl", "fedex")))
+        retry_setting = db.session.get(StoreSetting, "shipping_retry_codes")
+        try:
+            failed_destinations = json.loads(retry_setting.value) if retry_setting else []
+        except (TypeError, ValueError):
+            failed_destinations = []
+        latest_job = jobs[0] if jobs else None
+        progress = {"total_destinations": total_destinations, "reviewed_destinations": reviewed_destinations,
+                    "pending_destinations": max(0, total_destinations - reviewed_destinations),
+                    "failed_destinations": failed_destinations,
+                    "current_destination": latest_job.current_destination if latest_job and latest_job.status == "running" else None,
+                    "last_success_at": latest_job.finished_at.isoformat() if latest_job and latest_job.succeeded and latest_job.finished_at else None}
+        return jsonify(progress=progress, community_provider_label=os.getenv("COMMUNITY_COURIER_LABEL", "Community Courier"), rates=[{"id": r.id, "country_code": r.country_code, "country_name": r.country_name,
                                    "origin": r.origin, "provider": r.provider,
                                    "base_price_usd": str(r.base_price_usd) if r.base_price_usd is not None else None,
                                    "rate_version": r.rate_version, "status": r.status, "confidence": r.confidence,
-                                   "sources": safe_sources(r.sources), "notes": r.notes,
+                                   "sources": safe_sources(r.sources), "evidence": r.evidence, "notes": r.notes,
                                    "researched_at": r.researched_at.isoformat() if r.researched_at else None,
                                    "expires_at": r.expires_at.isoformat() if r.expires_at else None,
                                    "manual_override": r.manual_override, "current": shipping_rate_is_current(r)} for r in rows],
                        jobs=[{"id": j.id, "status": j.status, "attempted": j.attempted, "succeeded": j.succeeded,
-                              "failed": j.failed, "message": j.message, "started_at": j.started_at.isoformat(),
+                              "failed": j.failed, "tokens_used": j.tokens_used,
+                              "rate_limit_remaining": j.rate_limit_remaining, "current_destination": j.current_destination,
+                              "pending": j.pending, "message": j.message, "started_at": j.started_at.isoformat(),
                               "finished_at": j.finished_at.isoformat() if j.finished_at else None} for j in jobs])
 
     @app.get("/api/admin/shipping/<int:estimate_id>/history")
@@ -561,20 +602,7 @@ def create_app(test_config=None):
     @app.post("/api/admin/shipping/refresh")
     @admin_required
     def admin_shipping_refresh():
-        payload = request.get_json(silent=True) or {}
-        code = str(payload.get("country_code", "")).strip().upper()
-        if code:
-            from pycountry import countries
-            if not countries.get(alpha_2=code):
-                return error("Unsupported country code", 400)
-        try:
-            job = refresh_destinations([code] if code else None, maximum=1 if code else None)
-            return jsonify(job_id=job.id, status=job.status, attempted=job.attempted,
-                           succeeded=job.succeeded, failed=job.failed, message=job.message), 200
-        except Exception as exc:
-            db.session.rollback()
-            app.logger.exception("Shipping estimate refresh failed")
-            return error("Shipping estimate refresh failed: " + str(exc)[:240], 502)
+        return error("Shipping research runs automatically through the scheduled background job.", 409)
 
     @app.put("/api/admin/shipping/override")
     @admin_required
@@ -596,12 +624,13 @@ def create_app(test_config=None):
             return error("Manual source must be an HTTPS URL", 400)
         row = ShippingRate.query.filter_by(country_code=code, provider=provider).first()
         if row:
-            db.session.add(ShippingRateHistory(rate_id=row.id, snapshot=json.dumps({"base_price_usd": str(row.base_price_usd) if row.base_price_usd is not None else None, "status": row.status, "sources": row.sources, "researched_at": row.researched_at.isoformat() if row.researched_at else None, "rate_version": row.rate_version})))
+            db.session.add(ShippingRateHistory(rate_id=row.id, snapshot=json.dumps({"base_price_usd": str(row.base_price_usd) if row.base_price_usd is not None else None, "status": row.status, "sources": row.sources, "evidence": row.evidence, "researched_at": row.researched_at.isoformat() if row.researched_at else None, "rate_version": row.rate_version})))
         else:
             row = ShippingRate(country_code=code, provider=provider)
             db.session.add(row)
         row.country_name, row.origin, row.base_price_usd, row.status = country.name, "Shenzhen, China", price, "available"
         row.confidence, row.sources, row.notes = "manual", json.dumps(sources), str(payload.get("notes", ""))[:1000]
+        row.evidence = "Administrator-approved manual rate."
         row.researched_at, row.expires_at, row.manual_override = datetime.now(timezone.utc), datetime.now(timezone.utc) + timedelta(days=365), True
         row.rate_version = (row.rate_version or 0) + 1
         db.session.commit()
@@ -642,7 +671,8 @@ def create_app(test_config=None):
                 conversion = usd_gmd_conversion()
             except RuntimeError:
                 providers["modem"] = False
-        return jsonify(mode=mode, providers=providers, currency="USD", shipping_methods=methods, modem_conversion=conversion)
+        return jsonify(mode=mode, providers=providers, currency="USD", shipping_methods=methods,
+                       community_provider_label=os.getenv("COMMUNITY_COURIER_LABEL", "Community Courier"), modem_conversion=conversion)
 
     @app.post("/api/payments/checkout")
     def create_payment_checkout():

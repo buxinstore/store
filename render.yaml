@@ -48,10 +48,20 @@ services:
         sync: false
       - key: SHIPPING_ESTIMATE_MAX_DESTINATIONS_PER_RUN
         value: "10"
+      - key: SHIPPING_BATCH_SIZE
+        value: "10"
       - key: SHIPPING_ESTIMATE_MAX_AGE_DAYS
         value: "30"
       - key: SHIPPING_MAX_DESTINATIONS_PER_UTC_DAY
         value: "10"
+      - key: SHIPPING_RESEARCH_MAX_OUTPUT_TOKENS
+        value: "1400"
+      - key: SHIPPING_RESEARCH_MAX_RETRIES
+        value: "1"
+      - key: SHIPPING_REQUEST_DELAY_SECONDS
+        value: "15"
+      - key: COMMUNITY_COURIER_LABEL
+        value: "Community Courier"
   - type: cron
     name: electrohub-shipping-refresh
     runtime: python
@@ -67,7 +77,15 @@ services:
         sync: false
       - key: SHIPPING_ESTIMATE_MAX_DESTINATIONS_PER_RUN
         value: "10"
+      - key: SHIPPING_BATCH_SIZE
+        value: "10"
       - key: SHIPPING_ESTIMATE_MAX_AGE_DAYS
         value: "30"
       - key: SHIPPING_MAX_DESTINATIONS_PER_UTC_DAY
         value: "10"
+      - key: SHIPPING_RESEARCH_MAX_OUTPUT_TOKENS
+        value: "1400"
+      - key: SHIPPING_RESEARCH_MAX_RETRIES
+        value: "1"
+      - key: SHIPPING_REQUEST_DELAY_SECONDS
+        value: "15"
