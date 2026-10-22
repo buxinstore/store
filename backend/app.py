@@ -34,6 +34,7 @@ ALLOWED_ORDER_STATUSES = {"pending", "processing", "shipped", "completed", "canc
 PAYMENT_MODES = {"test", "live"}
 PAYMENT_PROVIDERS = {"modem", "paypal"}
 ONLINE_PAYMENT_MESSAGE = "Online payments are not configured for the selected payment mode."
+GROQ_CHAT_MODEL = "openai/gpt-oss-120b"
 DEFAULT_SHIPPING_METHODS = [
     {"id": "dhl", "name": "DHL", "price": "4.99", "enabled": True},
     {"id": "fedex", "name": "FedEx", "price": "4.99", "enabled": True},
@@ -864,62 +865,6 @@ def create_app(test_config=None):
         )
         return jsonify(token=token, expires_in=app.config["ADMIN_TOKEN_TTL_SECONDS"])
 
-    @app.get("/api/admin/ai/settings")
-    @admin_required
-    def admin_ai_settings():
-        key, _ = get_groq_key()
-        return jsonify(configured=bool(key), source="environment" if key else None)
-
-    def groq_error_detail(exc, api_key):
-        try:
-            raw = exc.read().decode("utf-8", errors="replace").strip()
-            parsed = json.loads(raw) if raw else {}
-            error_info = parsed.get("error", {}) if isinstance(parsed, dict) else {}
-            if isinstance(error_info, dict):
-                detail = error_info.get("message", "")
-                error_type = error_info.get("type", "")
-                error_code = error_info.get("code", "")
-            elif isinstance(error_info, str):
-                detail, error_type, error_code = error_info, "", ""
-            else:
-                detail = parsed.get("message", "") if isinstance(parsed, dict) else ""
-                error_type, error_code = "", ""
-            if not isinstance(detail, str) or not detail.strip():
-                detail = raw if not isinstance(parsed, dict) else ""
-            detail = detail.replace(api_key, "[redacted]").strip()[:500]
-            metadata = " · ".join(str(value) for value in (error_type, error_code) if value)
-            return f"{detail} ({metadata})" if detail and metadata else detail
-        except (OSError, UnicodeError, json.JSONDecodeError, AttributeError):
-            return ""
-
-    @app.get("/api/admin/ai/models")
-    @admin_required
-    def list_admin_groq_models():
-        api_key, _ = get_groq_key()
-        if not api_key:
-            return error("Set GROQ_API_KEY in the Render service environment variables first", 409)
-        req = Request("https://api.groq.com/openai/v1/models",
-                      headers={"Authorization": f"Bearer {api_key}"})
-        try:
-            with urlopen(req, timeout=20) as response:
-                result = json.loads(response.read().decode("utf-8"))
-            all_models = [item.get("id") for item in result.get("data", [])
-                          if isinstance(item, dict) and isinstance(item.get("id"), str)]
-            skip = ("whisper", "guard", "tts", "orpheus", "playai", "embed")
-            models = list(dict.fromkeys(model for model in all_models
-                                        if not any(term in model.lower() for term in skip)))
-            return jsonify(models=models)
-        except HTTPError as exc:
-            detail = groq_error_detail(exc, api_key)
-            app.logger.warning("Groq model list request failed with HTTP %s", exc.code)
-            if exc.code == 403:
-                return error("Groq denied the Render model-list request. Since the local test script works, confirm Render's GROQ_API_KEY exactly matches the working key and has the same Groq project access." + (f" {detail}" if detail else ""), 502)
-            return error(f"Groq model access check failed (HTTP {exc.code})" + (f": {detail}" if detail else ""), 502)
-        except (URLError, TimeoutError):
-            return error("Could not connect to Groq. Try again shortly.", 502)
-        except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
-            return error("Groq returned an invalid model list.", 502)
-
     @app.post("/api/admin/ai/test")
     @admin_required
     def test_admin_groq_chat():
@@ -945,21 +890,11 @@ def create_app(test_config=None):
         api_key, _ = get_groq_key()
         if not api_key:
             return error("Set GROQ_API_KEY in the Render service environment variables first", 409)
+        model = GROQ_CHAT_MODEL
+        body = json.dumps({"model": model, "messages": messages}).encode("utf-8")
+        req = Request("https://api.groq.com/openai/v1/chat/completions", data=body,
+                      headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
         try:
-            model_list_request = Request("https://api.groq.com/openai/v1/models",
-                                         headers={"Authorization": f"Bearer {api_key}"})
-            with urlopen(model_list_request, timeout=30) as response:
-                model_list = json.loads(response.read().decode("utf-8"))
-            skip = ("whisper", "guard", "tts", "orpheus", "playai", "embed")
-            chat_models = [item["id"] for item in model_list.get("data", [])
-                           if isinstance(item, dict) and isinstance(item.get("id"), str)
-                           and not any(term in item["id"].lower() for term in skip)]
-            if not chat_models:
-                return error("Groq did not list any chat-capable models for the Render GROQ_API_KEY", 502)
-            model = chat_models[0]
-            body = json.dumps({"model": model, "messages": messages}).encode("utf-8")
-            req = Request("https://api.groq.com/openai/v1/chat/completions", data=body,
-                          headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
             with urlopen(req, timeout=30) as response:
                 result = json.loads(response.read().decode("utf-8"))
             reply = result["choices"][0]["message"]["content"]
@@ -968,12 +903,18 @@ def create_app(test_config=None):
             return jsonify(reply=reply, model=model)
         except HTTPError as exc:
             app.logger.warning("Groq chat request failed with HTTP %s", exc.code)
-            detail = groq_error_detail(exc, api_key)
+            try:
+                provider_error = json.loads(exc.read().decode("utf-8", errors="replace"))
+                error_data = provider_error.get("error", {}) if isinstance(provider_error, dict) else {}
+                detail = error_data.get("message", "") if isinstance(error_data, dict) else ""
+                detail = str(detail).replace(api_key, "[redacted]").strip()[:500]
+            except (OSError, UnicodeError, json.JSONDecodeError, AttributeError):
+                detail = ""
             suffix = f": {detail}" if detail else ""
             if exc.code == 401:
                 return error("Groq rejected the API key. Check that it is valid and active." + suffix, 502)
             if exc.code == 403:
-                return error("Groq denied this request. Confirm Render's GROQ_API_KEY is exactly the working key from test.py and that it has inference access." + suffix, 502)
+                return error(f"Groq denied access to {model}. Check that Render's GROQ_API_KEY is active and allowed to use this model." + suffix, 502)
             if exc.code == 429:
                 return error("Groq rate limit or quota reached. Try again later." + suffix, 503)
             return error(f"Groq could not complete the test (HTTP {exc.code})" + suffix, 502)
