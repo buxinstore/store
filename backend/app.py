@@ -17,22 +17,24 @@ import cloudinary
 import cloudinary.uploader
 import requests
 from dotenv import load_dotenv
-from flask import Flask, jsonify, redirect, request
+from flask import Flask, jsonify, redirect, request, send_file
 from flask_cors import CORS
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from sqlalchemy import inspect, text
 from sqlalchemy.exc import SQLAlchemyError
 from werkzeug.exceptions import RequestEntityTooLarge
 
-from models import Category, Order, OrderItem, PaymentAttempt, Product, StoreSetting, ShippingEstimate, ShippingEstimateHistory, ShippingRate, ShippingRateHistory, ShippingRefreshJob, ShippingReconciliation, db
+from models import Category, Order, OrderItem, PaymentAttempt, Product, StoreSetting, ShippingEstimate, ShippingEstimateHistory, ShippingRate, ShippingRateHistory, ShippingRefreshJob, ShippingReconciliation, ShippingExcelImport, db
 from catalog_seed import seed_starter_catalog
 from shipping_core import billable_weight, estimate_is_current, missing_provider_rate_pairs, shipping_charge, shipping_rate_is_current, safe_sources
+from shipping_excel import build_template, parse_workbook, MAX_XLSX_BYTES
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 ALLOWED_ORDER_STATUSES = {"pending", "processing", "shipped", "completed", "cancelled"}
 PAYMENT_MODES = {"test", "live"}
 PAYMENT_PROVIDERS = {"modem", "paypal"}
+SHIPPING_MODES = {"manual_excel", "ai_research"}
 ONLINE_PAYMENT_MESSAGE = "Online payments are not configured for the selected payment mode."
 DEFAULT_SHIPPING_METHODS = [
     {"id": "dhl", "name": "DHL", "price": "4.99", "enabled": True},
@@ -103,6 +105,9 @@ def create_app(test_config=None):
             db.session.add(ShippingRate(country_code=country_code, country_name=country_names[country_code],
                 provider=provider_id, status="manual_review"))
         db.session.commit()
+        if not db.session.get(StoreSetting, "shipping_management_mode"):
+            db.session.add(StoreSetting(key="shipping_management_mode", value="ai_research"))
+            db.session.commit()
         # AI credentials now come only from the server environment.
         obsolete_groq_settings = [db.session.get(StoreSetting, key)
                                   for key in ("groq_api_key_encrypted", "groq_model")]
@@ -139,6 +144,15 @@ def create_app(test_config=None):
         if "evidence" not in rate_columns:
             with db.engine.begin() as connection:
                 connection.execute(text("ALTER TABLE shipping_rates ADD COLUMN evidence TEXT"))
+        if "source_type" not in rate_columns:
+            with db.engine.begin() as connection:
+                connection.execute(text("ALTER TABLE shipping_rates ADD COLUMN source_type VARCHAR(24) NOT NULL DEFAULT 'ai_research'"))
+        if "approved" not in rate_columns:
+            with db.engine.begin() as connection:
+                connection.execute(text("ALTER TABLE shipping_rates ADD COLUMN approved BOOLEAN NOT NULL DEFAULT FALSE"))
+        with db.engine.begin() as connection:
+            connection.execute(text("UPDATE shipping_rates SET approved = TRUE WHERE status = 'available' AND approved = FALSE"))
+            connection.execute(text("UPDATE shipping_rates SET source_type = 'manual_admin' WHERE manual_override = TRUE AND source_type = 'ai_research'"))
         job_columns = {column["name"] for column in inspect(db.engine).get_columns("shipping_refresh_jobs")}
         job_migrations = {
             "tokens_used": "INTEGER NOT NULL DEFAULT 0",
@@ -562,7 +576,7 @@ def create_app(test_config=None):
             stamp = rate.researched_at if rate else None
             if stamp and stamp.tzinfo is None:
                 stamp = stamp.replace(tzinfo=timezone.utc)
-            return bool(rate and (rate.manual_override or (stamp and stamp >= cutoff)))
+            return bool(rate and ((rate.manual_override and rate.approved) or (stamp and stamp >= cutoff)))
         total_destinations = len(list(countries))
         reviewed_destinations = sum(1 for country in countries if all(reviewed(country.alpha_2, p) for p in ("dhl", "fedex")))
         retry_setting = db.session.get(StoreSetting, "shipping_retry_codes")
@@ -576,19 +590,160 @@ def create_app(test_config=None):
                     "failed_destinations": failed_destinations,
                     "current_destination": latest_job.current_destination if latest_job and latest_job.status == "running" else None,
                     "last_success_at": latest_job.finished_at.isoformat() if latest_job and latest_job.succeeded and latest_job.finished_at else None}
-        return jsonify(progress=progress, community_provider_label=os.getenv("COMMUNITY_COURIER_LABEL", "Community Courier"), rates=[{"id": r.id, "country_code": r.country_code, "country_name": r.country_name,
+        mode_setting = db.session.get(StoreSetting, "shipping_management_mode")
+        shipping_mode = mode_setting.value if mode_setting and mode_setting.value in SHIPPING_MODES else "ai_research"
+        return jsonify(mode=shipping_mode, progress=progress, community_provider_label=os.getenv("COMMUNITY_COURIER_LABEL", "Community Courier"), rates=[{"id": r.id, "country_code": r.country_code, "country_name": r.country_name,
                                    "origin": r.origin, "provider": r.provider,
                                    "base_price_usd": str(r.base_price_usd) if r.base_price_usd is not None else None,
                                    "rate_version": r.rate_version, "status": r.status, "confidence": r.confidence,
                                    "sources": safe_sources(r.sources), "evidence": r.evidence, "notes": r.notes,
                                    "researched_at": r.researched_at.isoformat() if r.researched_at else None,
                                    "expires_at": r.expires_at.isoformat() if r.expires_at else None,
-                                   "manual_override": r.manual_override, "current": shipping_rate_is_current(r)} for r in rows],
+                                   "manual_override": r.manual_override, "source_type": r.source_type,
+                                   "approved": r.approved, "current": shipping_rate_is_current(r)} for r in rows],
                        jobs=[{"id": j.id, "status": j.status, "attempted": j.attempted, "succeeded": j.succeeded,
                               "failed": j.failed, "tokens_used": j.tokens_used,
                               "rate_limit_remaining": j.rate_limit_remaining, "current_destination": j.current_destination,
                               "pending": j.pending, "message": j.message, "started_at": j.started_at.isoformat(),
                               "finished_at": j.finished_at.isoformat() if j.finished_at else None} for j in jobs])
+
+    @app.put("/api/admin/shipping/mode")
+    @admin_required
+    def admin_shipping_mode():
+        payload = request.get_json(silent=True) or {}
+        mode = str(payload.get("mode", "")).strip().lower()
+        if mode not in SHIPPING_MODES:
+            return error("Choose Manual Excel Mode or AI Research Mode", 400)
+        setting = db.session.get(StoreSetting, "shipping_management_mode")
+        if setting:
+            setting.value = mode
+        else:
+            db.session.add(StoreSetting(key="shipping_management_mode", value=mode))
+        if mode == "manual_excel":
+            active_jobs = ShippingRefreshJob.query.filter_by(status="running").with_for_update().all()
+            for job in active_jobs:
+                job.status = "stopped_manual_mode"
+                job.message = (job.message or "") + "Stopped because Manual Excel Mode was selected; any in-flight Groq result will be discarded.\n"
+        db.session.commit()
+        return jsonify(mode=mode, status="saved", message=(
+            "AI research is disabled. Any in-flight Groq result will be discarded before saving." if mode == "manual_excel"
+            else "AI research is enabled; the next scheduled run will resume eligible destinations."))
+
+    @app.get("/api/admin/shipping/excel-template")
+    @admin_required
+    def admin_shipping_excel_template():
+        from pycountry import countries
+        workbook = build_template(list(countries))
+        return send_file(workbook, mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                         as_attachment=True, download_name="buxin-shipping-rates-template.xlsx")
+
+    @app.post("/api/admin/shipping/excel-preview")
+    @admin_required
+    def admin_shipping_excel_preview():
+        mode_setting = db.session.get(StoreSetting, "shipping_management_mode")
+        if not mode_setting or mode_setting.value != "manual_excel":
+            return error("Switch to Manual Excel Mode before uploading shipping rates", 409)
+        upload = request.files.get("file")
+        if not upload or not upload.filename or not upload.filename.lower().endswith(".xlsx"):
+            return error("Choose an .xlsx Excel file", 400)
+        data = upload.stream.read(MAX_XLSX_BYTES + 1)
+        try:
+            from pycountry import countries
+            parsed = parse_workbook(data, list(countries))
+        except ValueError as exc:
+            return error(str(exc), 400)
+        rate_lookup = {(rate.country_code, rate.provider): rate for rate in ShippingRate.query.all()}
+        create_count = update_count = blank_count = price_count = 0
+        for row in parsed["rows"]:
+            for provider in ("dhl", "fedex", "community"):
+                value = row["prices"].get(provider)
+                if value is None:
+                    blank_count += 1
+                else:
+                    price_count += 1
+                    if (row["country_code"], provider) in rate_lookup:
+                        update_count += 1
+                    else:
+                        create_count += 1
+        zero_count = len(parsed["zeros"])
+        preview = {"recognized_rows": parsed["recognized_rows"], "valid_prices": price_count,
+                   "prices_to_create": create_count, "existing_prices_to_update": update_count,
+                   "blank_prices_unchanged": blank_count, "invalid_rows": parsed["invalid_rows"],
+                   "errors": parsed["errors"], "zero_prices": zero_count,
+                   "rates_requiring_review": price_count, "approval_required": True}
+        import_id = None
+        if not preview["invalid_rows"]:
+            staged = ShippingExcelImport(id=str(uuid4()), payload=json.dumps(parsed["rows"]),
+                                         preview=json.dumps(preview), created_at=datetime.now(timezone.utc))
+            db.session.add(staged)
+            db.session.commit()
+            import_id = staged.id
+        return jsonify(import_id=import_id, preview=preview), 201
+
+    @app.post("/api/admin/shipping/excel-confirm")
+    @admin_required
+    def admin_shipping_excel_confirm():
+        payload = request.get_json(silent=True) or {}
+        if payload.get("confirm_import") is not True:
+            return error("Explicitly confirm the reviewed Excel import", 400)
+        mode_setting = db.session.get(StoreSetting, "shipping_management_mode")
+        if not mode_setting or mode_setting.value != "manual_excel":
+            return error("Switch to Manual Excel Mode before importing shipping rates", 409)
+        staged = ShippingExcelImport.query.filter_by(id=str(payload.get("import_id", ""))).with_for_update().first()
+        staged_created = staged.created_at if staged else None
+        if staged_created and staged_created.tzinfo is None:
+            staged_created = staged_created.replace(tzinfo=timezone.utc)
+        if not staged or staged.consumed_at or staged_created < datetime.now(timezone.utc) - timedelta(minutes=30):
+            return error("This preview expired or has already been imported. Upload the workbook again.", 409)
+        preview, rows = json.loads(staged.preview), json.loads(staged.payload)
+        if preview.get("invalid_rows"):
+            return error("Fix every invalid or duplicate row and upload the workbook again.", 400)
+        mode_setting = StoreSetting.query.filter_by(key="shipping_management_mode").populate_existing().with_for_update().first()
+        if not mode_setting or mode_setting.value != "manual_excel":
+            return error("Manual Excel Mode changed; upload the workbook again after selecting it.", 409)
+        approve = payload.get("approve_prices") is True
+        if preview.get("zero_prices") and payload.get("confirm_zero_prices") is not True:
+            return error("Explicitly confirm the numeric zero prices, or correct them in the workbook.", 400)
+        now = datetime.now(timezone.utc)
+        try:
+            changed = []
+            for item in rows:
+                for provider, raw_price in item["prices"].items():
+                    price = Decimal(raw_price).quantize(Decimal("0.01"))
+                    if not price.is_finite() or price < 0 or price > Decimal("100000"):
+                        raise ValueError(f"Invalid price in workbook row {item['row']} for {provider}.")
+                    rate = ShippingRate.query.filter_by(country_code=item["country_code"], provider=provider).with_for_update().first()
+                    if rate is None:
+                        rate = ShippingRate(country_code=item["country_code"], country_name=item["country_name"], provider=provider)
+                        db.session.add(rate)
+                        db.session.flush()
+                    else:
+                        db.session.add(ShippingRateHistory(rate_id=rate.id, snapshot=json.dumps({
+                            "base_price_usd": str(rate.base_price_usd) if rate.base_price_usd is not None else None,
+                            "status": rate.status, "sources": rate.sources, "evidence": rate.evidence,
+                            "source_type": rate.source_type, "approved": rate.approved,
+                            "researched_at": rate.researched_at.isoformat() if rate.researched_at else None,
+                            "rate_version": rate.rate_version})))
+                    rate.country_name, rate.origin, rate.base_price_usd = item["country_name"], item["origin"], price
+                    rate.status = "available" if approve else "manual_review"
+                    rate.source_type, rate.approved, rate.manual_override = "excel_import", approve, True
+                    rate.confidence = "manual"
+                    rate.sources, rate.evidence = None, None
+                    rate.notes = ("Excel import " + now.isoformat() + ("; administrator approved for checkout. " if approve else "; awaiting administrator approval. ") + item["notes"])[:1000]
+                    rate.researched_at = None
+                    rate.expires_at = now + timedelta(days=365) if approve else None
+                    rate.rate_version = (rate.rate_version or 0) + 1
+                    changed.append({"country_code": item["country_code"], "provider": provider, "price_usd": str(price), "approved": approve})
+            staged.consumed_at = now
+            db.session.commit()
+        except Exception as exc:
+            db.session.rollback()
+            if isinstance(exc, ValueError):
+                return error(str(exc), 400)
+            app.logger.exception("Shipping Excel import transaction failed")
+            return error("Excel import was rolled back; no rates were changed", 500)
+        return jsonify(imported_prices=len(changed), approved=approve, changes=changed,
+                       message=f"Imported {len(changed)} rates; {'approved for checkout' if approve else 'left in manual review'}.")
 
     @app.get("/api/admin/shipping/<int:estimate_id>/history")
     @admin_required
@@ -624,13 +779,14 @@ def create_app(test_config=None):
             return error("Manual source must be an HTTPS URL", 400)
         row = ShippingRate.query.filter_by(country_code=code, provider=provider).first()
         if row:
-            db.session.add(ShippingRateHistory(rate_id=row.id, snapshot=json.dumps({"base_price_usd": str(row.base_price_usd) if row.base_price_usd is not None else None, "status": row.status, "sources": row.sources, "evidence": row.evidence, "researched_at": row.researched_at.isoformat() if row.researched_at else None, "rate_version": row.rate_version})))
+            db.session.add(ShippingRateHistory(rate_id=row.id, snapshot=json.dumps({"base_price_usd": str(row.base_price_usd) if row.base_price_usd is not None else None, "status": row.status, "sources": row.sources, "evidence": row.evidence, "source_type": row.source_type, "approved": row.approved, "researched_at": row.researched_at.isoformat() if row.researched_at else None, "rate_version": row.rate_version})))
         else:
             row = ShippingRate(country_code=code, provider=provider)
             db.session.add(row)
         row.country_name, row.origin, row.base_price_usd, row.status = country.name, "Shenzhen, China", price, "available"
         row.confidence, row.sources, row.notes = "manual", json.dumps(sources), str(payload.get("notes", ""))[:1000]
         row.evidence = "Administrator-approved manual rate."
+        row.source_type, row.approved = "manual_admin", True
         row.researched_at, row.expires_at, row.manual_override = datetime.now(timezone.utc), datetime.now(timezone.utc) + timedelta(days=365), True
         row.rate_version = (row.rate_version or 0) + 1
         db.session.commit()
@@ -1282,7 +1438,7 @@ def create_app(test_config=None):
 
     @app.errorhandler(RequestEntityTooLarge)
     def request_too_large(_exc):
-        return error("Image is larger than the configured upload limit", 413)
+        return error("Uploaded file is larger than the configured upload limit", 413)
 
     @app.errorhandler(404)
     def not_found(_exc):

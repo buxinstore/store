@@ -34,6 +34,16 @@ class BillableWeightTests(unittest.TestCase):
         self.assertEqual(billable_units("1.5"), 3)
         self.assertEqual(shipping_charge("1.5", "4.00"), (Decimal("1.5"), 3, Decimal("12.00")))
 
+    def test_approved_zero_price_requires_explicit_approval_and_calculates_free_shipping(self):
+        now = utcnow()
+        approved = SimpleNamespace(status="available", base_price_usd=Decimal("0.00"),
+            expires_at=now - timedelta(days=1), manual_override=True, approved=True)
+        unapproved = SimpleNamespace(status="available", base_price_usd=Decimal("0.00"),
+            expires_at=now + timedelta(days=1), manual_override=False, approved=False)
+        self.assertTrue(shipping_rate_is_current(approved, now))
+        self.assertFalse(shipping_rate_is_current(unapproved, now))
+        self.assertEqual(shipping_charge("1", "0.00")[2], Decimal("0.00"))
+
 
 class ProviderRateTests(unittest.TestCase):
     def test_provider_rates_are_separate_and_only_fresh_or_override_is_current(self):

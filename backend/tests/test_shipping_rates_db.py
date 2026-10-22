@@ -5,8 +5,8 @@ from decimal import Decimal
 
 from flask import Flask
 
-from models import Order, ShippingRate, ShippingRateHistory, db, utcnow
-from shipping import save_provider_rate
+from models import Order, ShippingRate, ShippingRateHistory, ShippingRefreshJob, StoreSetting, db, utcnow
+from shipping import refresh_destinations, save_provider_rate
 from shipping_core import shipping_charge, shipping_rate_is_current
 
 
@@ -27,7 +27,7 @@ class ShippingRateDatabaseTests(unittest.TestCase):
 
     def test_country_provider_lookup_and_missing_or_stale_rates(self):
         now = utcnow()
-        dhl = ShippingRate(country_code="GM", country_name="Gambia", provider="dhl", base_price_usd=Decimal("4.00"), status="available", expires_at=now + timedelta(days=2))
+        dhl = ShippingRate(country_code="GM", country_name="Gambia", provider="dhl", base_price_usd=Decimal("4.00"), status="available", approved=True, expires_at=now + timedelta(days=2))
         fedex = ShippingRate(country_code="GM", country_name="Gambia", provider="fedex", status="manual_review")
         stale = ShippingRate(country_code="US", country_name="United States", provider="dhl", base_price_usd=Decimal("8.00"), status="available", expires_at=now - timedelta(days=1))
         db.session.add_all([dhl, fedex, stale]); db.session.commit()
@@ -52,6 +52,45 @@ class ShippingRateDatabaseTests(unittest.TestCase):
         self.assertFalse(save_provider_rate("GM", "Gambia", "dhl", {"amount": Decimal("2.00"), "sources": [{"url": "https://carrier.example/new"}]}))
         db.session.commit()
         self.assertEqual(rate.base_price_usd, Decimal("7.00"))
+
+    def test_manual_excel_mode_blocks_scheduled_ai_jobs(self):
+        db.session.add(StoreSetting(key="shipping_management_mode", value="manual_excel"))
+        db.session.commit()
+        job = refresh_destinations(maximum=1)
+        self.assertEqual(job.status, "paused_manual_mode")
+        self.assertEqual(job.attempted, 0)
+
+    def test_inflight_groq_result_is_discarded_after_manual_mode_switch(self):
+        db.session.add_all([StoreSetting(key="shipping_management_mode", value="ai_research"),
+                            StoreSetting(key="shipping_refresh_cursor", value="0")])
+        db.session.commit()
+
+        def switch_to_manual(_country):
+            setting = db.session.get(StoreSetting, "shipping_management_mode")
+            setting.value = "manual_excel"
+            db.session.commit()
+            return {"tokens_used": 1, "remaining_tokens": "100", "providers": {
+                "dhl": {"amount": Decimal("4.00"), "sources": [{"url": "https://www.dhl.com/rates"}], "confidence": "high"},
+                "fedex": {"amount": Decimal("5.00"), "sources": [{"url": "https://www.fedex.com/rates"}], "confidence": "high"},
+            }}
+
+        from unittest.mock import patch
+        with patch("shipping.groq_research_destination", side_effect=switch_to_manual):
+            job = refresh_destinations(maximum=1)
+        self.assertEqual(job.status, "stopped_manual_mode")
+        self.assertEqual(job.succeeded, 0)
+        self.assertEqual(ShippingRate.query.count(), 0)
+
+    def test_excel_approved_rate_is_preserved_by_ai_research(self):
+        rate = ShippingRate(country_code="GM", country_name="Gambia", provider="dhl", base_price_usd=Decimal("0.00"),
+            status="available", source_type="excel_import", manual_override=True, approved=True)
+        db.session.add(rate)
+        db.session.commit()
+        self.assertFalse(save_provider_rate("GM", "Gambia", "dhl", {
+            "amount": Decimal("9.99"), "sources": [{"url": "https://www.dhl.com/new-rate"}], "confidence": "high"}))
+        db.session.commit()
+        self.assertEqual(rate.base_price_usd, Decimal("0.00"))
+        self.assertEqual(rate.source_type, "excel_import")
 
     def test_order_shipping_snapshot_survives_later_rate_changes(self):
         rate = ShippingRate(country_code="GM", country_name="Gambia", provider="dhl", base_price_usd=Decimal("4.00"), status="available", rate_version=2)

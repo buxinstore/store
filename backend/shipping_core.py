@@ -24,8 +24,8 @@ def billable_units(actual_kg):
 def shipping_charge(actual_kg, base_price_usd):
     """Return billable weight, units, and USD charge for a saved base rate."""
     price = Decimal(str(base_price_usd))
-    if not price.is_finite() or price <= 0:
-        raise ValueError("A positive saved shipping rate is required")
+    if not price.is_finite() or price < 0:
+        raise ValueError("A nonnegative saved shipping rate is required")
     weight = billable_weight(actual_kg)
     units = int(weight / Decimal("0.5"))
     return weight, units, (price * units).quantize(Decimal("0.01"))
@@ -36,8 +36,8 @@ def shipping_rate_is_current(row, now=None):
     expires = row.expires_at
     if expires and expires.tzinfo is None:
         expires = expires.replace(tzinfo=timezone.utc)
-    return (row.status == "available" and row.base_price_usd is not None
-            and Decimal(str(row.base_price_usd)) > 0
+    return (row.status == "available" and getattr(row, "approved", True) and row.base_price_usd is not None
+            and Decimal(str(row.base_price_usd)) >= 0
             and (row.manual_override or (expires is not None and expires > now)))
 
 

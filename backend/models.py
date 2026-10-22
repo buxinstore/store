@@ -203,7 +203,7 @@ class ShippingEstimateHistory(db.Model):
 
 
 class ShippingRate(db.Model):
-    """Single approved USD base rate per destination and shipping provider."""
+    """Canonical USD base-rate and provenance record per destination/provider."""
     __tablename__ = "shipping_rates"
     __table_args__ = (UniqueConstraint("country_code", "provider", name="uq_shipping_rate_country_provider"),)
 
@@ -221,6 +221,8 @@ class ShippingRate(db.Model):
     researched_at = db.Column(db.DateTime(timezone=True))
     expires_at = db.Column(db.DateTime(timezone=True))
     manual_override = db.Column(db.Boolean, nullable=False, default=False)
+    source_type = db.Column(db.String(24), nullable=False, default="ai_research")
+    approved = db.Column(db.Boolean, nullable=False, default=False)
     rate_version = db.Column(db.Integer, nullable=False, default=1)
     updated_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
 
@@ -231,6 +233,15 @@ class ShippingRateHistory(db.Model):
     rate_id = db.Column(db.Integer, nullable=False, index=True)
     snapshot = db.Column(db.Text, nullable=False)
     created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow)
+
+
+class ShippingExcelImport(db.Model):
+    __tablename__ = "shipping_excel_imports"
+    id = db.Column(db.String(36), primary_key=True)
+    payload = db.Column(db.Text, nullable=False)
+    preview = db.Column(db.Text, nullable=False)
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow)
+    consumed_at = db.Column(db.DateTime(timezone=True))
 
 
 class ShippingRefreshJob(db.Model):

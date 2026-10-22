@@ -210,14 +210,36 @@ def save_provider_rate(country_code, country_name, provider, result):
     elif row.base_price_usd is None:
         row.expires_at = None
     row.manual_override = False
+    row.source_type = "ai_research"
+    row.approved = bool(valid)
     row.rate_version = (row.rate_version or 0) + 1
     # A completed research request is a successful provider check even when
     # it correctly records manual_review instead of inventing a price.
     return True
 
 
+def current_shipping_mode(lock=False):
+    """Read the persistent Admin mode afresh at each worker checkpoint."""
+    query = StoreSetting.query.filter_by(key="shipping_management_mode").populate_existing()
+    if lock:
+        query = query.with_for_update()
+    setting = query.first()
+    return setting.value if setting and setting.value in {"manual_excel", "ai_research"} else "ai_research"
+
+
+def research_job_allowed(job_id, lock_mode=False):
+    mode = current_shipping_mode(lock=lock_mode)
+    job = ShippingRefreshJob.query.filter_by(id=job_id).populate_existing().first()
+    return mode == "ai_research" and job is not None and job.status == "running"
+
+
 def refresh_destinations(destination_codes=None, maximum=None):
     from pycountry import countries
+    if current_shipping_mode() != "ai_research":
+        job = ShippingRefreshJob(status="paused_manual_mode", message="Skipped: Manual Excel Mode is active.", finished_at=utcnow())
+        db.session.add(job)
+        db.session.commit()
+        return job
     candidates = list(countries)
     cursor_key = "shipping_refresh_cursor"
     cursor_setting = db.session.get(StoreSetting, cursor_key) if not destination_codes else None
@@ -265,6 +287,10 @@ def refresh_destinations(destination_codes=None, maximum=None):
         daily_used = db.session.query(db.func.coalesce(db.func.sum(ShippingRefreshJob.attempted), 0)).filter(ShippingRefreshJob.started_at >= today).scalar() or 0
         rate_map = {(rate.country_code, rate.provider): rate for rate in ShippingRate.query.filter(ShippingRate.provider.in_(("dhl", "fedex"))).all()}
         for index, country in enumerate(candidates):
+            if not research_job_allowed(job.id):
+                job.status = "stopped_manual_mode"
+                job.message = (job.message or "") + "Stopped because Manual Excel Mode was selected. Completed results are saved.\n"
+                break
             if job.attempted >= maximum:
                 break
             if daily_used + job.attempted >= daily_limit:
@@ -282,9 +308,27 @@ def refresh_destinations(destination_codes=None, maximum=None):
                 next_cursor = (start_cursor + index + 1) % max(1, len(candidates) if destination_codes else len(list(countries)))
             try:
                 results = groq_research_destination(country.name)
+                db.session.expire_all()
+                if not research_job_allowed(job.id):
+                    job = db.session.get(ShippingRefreshJob, job.id)
+                    job.status = "stopped_manual_mode"
+                    job.message = (job.message or "") + "Manual Excel Mode was selected during the Groq request; its result was discarded.\n"
+                    if country.alpha_2 not in retry_pending:
+                        retry_pending.append(country.alpha_2)
+                    db.session.commit()
+                    break
                 job.tokens_used += results.get("tokens_used", 0)
                 job.rate_limit_remaining = results.get("remaining_tokens")
                 for provider in ("dhl", "fedex", "community"):
+                    db.session.expire_all()
+                    if not research_job_allowed(job.id, lock_mode=True):
+                        job = db.session.get(ShippingRefreshJob, job.id)
+                        job.status = "stopped_manual_mode"
+                        job.message = (job.message or "") + "Manual Excel Mode was selected; remaining provider results were discarded.\n"
+                        if country.alpha_2 not in retry_pending:
+                            retry_pending.append(country.alpha_2)
+                        db.session.commit()
+                        break
                     current = rate_map.get((country.alpha_2, provider)) if provider != "community" else None
                     if provider == "community" or current and (current.manual_override or not rate_needs_research(current, freshness_days=int(os.getenv("SHIPPING_ESTIMATE_MAX_AGE_DAYS", "30")))):
                         continue
@@ -296,6 +340,8 @@ def refresh_destinations(destination_codes=None, maximum=None):
                     elif not saved:
                         job.failed += 1
                     db.session.commit()
+                if job.status == "stopped_manual_mode":
+                    break
                 retry_pending = [code for code in retry_pending if code != country.alpha_2]
                 db.session.commit()
                 delay = max(0.0, min(float(os.getenv("SHIPPING_REQUEST_DELAY_SECONDS", "15")), 300.0))
@@ -320,7 +366,8 @@ def refresh_destinations(destination_codes=None, maximum=None):
             db.session.commit()
         job.pending = sum(1 for rate in ShippingRate.query.filter(ShippingRate.provider.in_(("dhl", "fedex"))).all() if rate_needs_research(rate, freshness_days=int(os.getenv("SHIPPING_ESTIMATE_MAX_AGE_DAYS", "30"))))
         job.current_destination = None
-        job.status = "completed_with_errors" if job.failed else "completed_with_pending" if job.pending else "completed"
+        if job.status != "stopped_manual_mode":
+            job.status = "completed_with_errors" if job.failed else "completed_with_pending" if job.pending else "completed"
     except Exception as exc:
         db.session.rollback()
         job.status, job.message = "failed", str(exc)[:1000]
