@@ -50,11 +50,26 @@ def database_uri():
     return uri
 
 
+def database_engine_options(uri):
+    if uri.startswith(("postgres://", "postgresql://", "postgresql+psycopg://")):
+        # Do not let an unavailable database or a DDL lock hold Gunicorn startup
+        # until Render's port scan times out.
+        return {
+            "connect_args": {
+                "connect_timeout": 10,
+                "options": "-c lock_timeout=10000 -c statement_timeout=30000",
+            }
+        }
+    return {}
+
+
 def create_app(test_config=None):
     app = Flask(__name__)
+    db_uri = database_uri()
     app.config.update(
         SECRET_KEY=os.getenv("SECRET_KEY", "local-development-secret-change-me"),
-        SQLALCHEMY_DATABASE_URI=database_uri(),
+        SQLALCHEMY_DATABASE_URI=db_uri,
+        SQLALCHEMY_ENGINE_OPTIONS=database_engine_options(db_uri),
         SQLALCHEMY_TRACK_MODIFICATIONS=False,
         MAX_CONTENT_LENGTH=int(os.getenv("MAX_CONTENT_LENGTH", 5 * 1024 * 1024)),
         ADMIN_TOKEN_TTL_SECONDS=8 * 60 * 60,
@@ -75,6 +90,7 @@ def create_app(test_config=None):
     if os.getenv("CLOUDINARY_URL"):
         cloudinary.config(secure=True)
 
+    app.logger.info("Initializing database schema and migrations")
     with app.app_context():
         db.create_all()
         # AI credentials now come only from the server environment.
@@ -126,6 +142,7 @@ def create_app(test_config=None):
                     connection.execute(text(f"ALTER TABLE payment_attempts ADD COLUMN {column} {sql_type}"))
         if Category.query.count() == 0 and Product.query.count() == 0:
             seed_starter_catalog(update_existing=False)
+    app.logger.info("Database schema and migrations are ready")
 
     def admin_required(fn):
         @wraps(fn)
