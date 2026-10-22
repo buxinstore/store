@@ -881,6 +881,51 @@ def create_app(test_config=None):
         return jsonify(configured=bool(key), source=source if key else None,
                        model=get_groq_model())
 
+    def groq_error_detail(exc, api_key):
+        try:
+            raw = exc.read().decode("utf-8", errors="replace").strip()
+            parsed = json.loads(raw) if raw else {}
+            error_info = parsed.get("error", {}) if isinstance(parsed, dict) else {}
+            if isinstance(error_info, dict):
+                detail = error_info.get("message", "")
+                error_type = error_info.get("type", "")
+                error_code = error_info.get("code", "")
+            elif isinstance(error_info, str):
+                detail, error_type, error_code = error_info, "", ""
+            else:
+                detail = parsed.get("message", "") if isinstance(parsed, dict) else ""
+                error_type, error_code = "", ""
+            if not isinstance(detail, str) or not detail.strip():
+                detail = raw if not isinstance(parsed, dict) else ""
+            detail = detail.replace(api_key, "[redacted]").strip()[:500]
+            metadata = " · ".join(str(value) for value in (error_type, error_code) if value)
+            return f"{detail} ({metadata})" if detail and metadata else detail
+        except (OSError, UnicodeError, json.JSONDecodeError, AttributeError):
+            return ""
+
+    @app.get("/api/admin/ai/models")
+    @admin_required
+    def list_admin_groq_models():
+        api_key, _ = get_groq_key()
+        if not api_key:
+            return error("Save a Groq API key or set GROQ_API_KEY on the server first", 409)
+        req = Request("https://api.groq.com/openai/v1/models",
+                      headers={"Authorization": f"Bearer {api_key}"})
+        try:
+            with urlopen(req, timeout=20) as response:
+                result = json.loads(response.read().decode("utf-8"))
+            models = sorted({item.get("id") for item in result.get("data", [])
+                             if isinstance(item, dict) and isinstance(item.get("id"), str)})
+            return jsonify(models=models)
+        except HTTPError as exc:
+            detail = groq_error_detail(exc, api_key)
+            app.logger.warning("Groq model list request failed with HTTP %s", exc.code)
+            return error(f"Groq model access check failed (HTTP {exc.code})" + (f": {detail}" if detail else ""), 502)
+        except (URLError, TimeoutError):
+            return error("Could not connect to Groq. Try again shortly.", 502)
+        except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+            return error("Groq returned an invalid model list.", 502)
+
     @app.put("/api/admin/ai/settings")
     @admin_required
     def update_admin_ai_settings():
@@ -906,9 +951,8 @@ def create_app(test_config=None):
                 messages.append("Groq API key saved securely.")
         if "model" in payload:
             model = str(payload["model"]).strip()
-            allowed_models = {"openai/gpt-oss-20b", "openai/gpt-oss-120b", "llama-3.1-8b-instant", "llama-3.3-70b-versatile"}
-            if model not in allowed_models:
-                return error("Choose a supported Groq model", 400)
+            if not model or len(model) > 120 or any(not (char.isalnum() or char in "-_./") for char in model):
+                return error("Choose a valid Groq model ID", 400)
             setting = db.session.get(StoreSetting, "groq_model")
             if setting:
                 setting.value = model
@@ -958,15 +1002,7 @@ def create_app(test_config=None):
             return jsonify(reply=reply, model=model)
         except HTTPError as exc:
             app.logger.warning("Groq chat request failed with HTTP %s", exc.code)
-            try:
-                provider_error = json.loads(exc.read().decode("utf-8"))
-                detail = provider_error.get("error", {}).get("message", "")
-            except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
-                detail = ""
-            if isinstance(detail, str):
-                detail = detail.replace(api_key, "[redacted]").strip()[:500]
-            else:
-                detail = ""
+            detail = groq_error_detail(exc, api_key)
             suffix = f": {detail}" if detail else ""
             if exc.code == 401:
                 return error("Groq rejected the API key. Check that it is valid and active." + suffix, 502)
