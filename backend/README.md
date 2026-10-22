@@ -109,8 +109,7 @@ Database changes use safe additive startup migrations, following the existing `d
 
 ### Groq Admin chat
 
-The authenticated Admin dashboard includes an AI Assistant panel for saving a Groq API key and sending a chat test. Keys entered there are encrypted in the store_settings database table and are never returned to the browser unless an authenticated admin uses the reveal control. Alternatively, set GROQ_API_KEY in the server environment; an Admin-saved key takes precedence. Choose a supported model in Admin, or set GROQ_MODEL on the server (defaults to `openai/gpt-oss-20b`). Use a strong, stable SECRET_KEY: rotating it makes an Admin-saved key unreadable, so clear and save the key again after rotation. The test chat uses Groq's OpenAI-compatible API endpoint and does not retain chat history.
+Set `GROQ_API_KEY` only in the Render service environment variables. The Admin page does not save, return, or display this secret; it reports whether the environment variable is configured. On startup, the backend removes any legacy Admin-saved Groq key from `store_settings`, so there is one active source of credentials. `GROQ_MODEL` is optional; Admin can save the selected model separately. The default model is `openai/gpt-oss-20b`.
 
-The Admin AI Assistant offers a deliberate reveal button for administrators who need to inspect their saved key. Revealing requires an active admin session; hide the key again when finished.
-
-The Groq Admin chat checks the models exposed to the configured key, filters out speech, moderation, and embedding model IDs, and sends bounded user/assistant conversation history with a fixed helpful-assistant system prompt. The root-level 	est.py is ignored by Git because local provider test scripts may contain credentials.
+The Admin chat checks models available to the environment key, filters out speech, moderation, and embedding models, and sends bounded user/assistant conversation history with a fixed helpful-assistant system prompt. The root-level `test.py` is ignored by Git because local provider test scripts may contain credentials.
+The local 	est.py helper reads GROQ_API_KEY from the environment too; do not put provider secrets in source files.

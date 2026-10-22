@@ -13,8 +13,6 @@ from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 from uuid import uuid4
 
-from cryptography.fernet import Fernet, InvalidToken
-
 import cloudinary
 import cloudinary.uploader
 from dotenv import load_dotenv
@@ -79,6 +77,11 @@ def create_app(test_config=None):
 
     with app.app_context():
         db.create_all()
+        # AI credentials now come only from the server environment.
+        obsolete_groq_key = db.session.get(StoreSetting, "groq_api_key_encrypted")
+        if obsolete_groq_key:
+            db.session.delete(obsolete_groq_key)
+            db.session.commit()
         # Additive, safe upgrades for databases created by earlier storefront versions.
         columns = {column["name"] for column in inspect(db.engine).get_columns("orders")}
         if "shipping_method" not in columns:
@@ -147,19 +150,7 @@ def create_app(test_config=None):
         setting = db.session.get(StoreSetting, "payment_mode")
         return setting.value if setting and setting.value in PAYMENT_MODES else "test"
 
-    def groq_cipher():
-        secret = str(app.config["SECRET_KEY"]).encode("utf-8")
-        key = base64.urlsafe_b64encode(hashlib.sha256(b"electrohub-groq-key-v1:" + secret).digest())
-        return Fernet(key)
-
     def get_groq_key():
-        setting = db.session.get(StoreSetting, "groq_api_key_encrypted")
-        if setting:
-            try:
-                return groq_cipher().decrypt(setting.value.encode("utf-8")).decode("utf-8"), "admin"
-            except (InvalidToken, ValueError, UnicodeDecodeError):
-                app.logger.error("Stored Groq key cannot be decrypted; check that SECRET_KEY has not changed")
-                return "", "admin"
         return os.getenv("GROQ_API_KEY", "").strip(), "environment"
 
     def get_groq_model():
@@ -908,7 +899,7 @@ def create_app(test_config=None):
     def list_admin_groq_models():
         api_key, _ = get_groq_key()
         if not api_key:
-            return error("Save a Groq API key or set GROQ_API_KEY on the server first", 409)
+            return error("Set GROQ_API_KEY in the Render service environment variables first", 409)
         req = Request("https://api.groq.com/openai/v1/models",
                       headers={"Authorization": f"Bearer {api_key}"})
         try:
@@ -932,49 +923,18 @@ def create_app(test_config=None):
     @admin_required
     def update_admin_ai_settings():
         payload = request.get_json(silent=True) or {}
-        messages = []
-        if "api_key" in payload:
-            if not isinstance(payload["api_key"], str):
-                return error("Groq API key must be text", 400)
-            api_key = payload["api_key"].strip()
-            setting = db.session.get(StoreSetting, "groq_api_key_encrypted")
-            if not api_key:
-                if setting:
-                    db.session.delete(setting)
-                messages.append("Saved key cleared.")
-            else:
-                if len(api_key) > 512 or any(char.isspace() for char in api_key):
-                    return error("The Groq API key format is invalid", 400)
-                encrypted = groq_cipher().encrypt(api_key.encode("utf-8")).decode("utf-8")
-                if setting:
-                    setting.value = encrypted
-                else:
-                    db.session.add(StoreSetting(key="groq_api_key_encrypted", value=encrypted))
-                messages.append("Groq API key saved securely.")
-        if "model" in payload:
-            model = str(payload["model"]).strip()
-            if not model or len(model) > 120 or any(not (char.isalnum() or char in "-_./") for char in model):
-                return error("Choose a valid Groq model ID", 400)
-            setting = db.session.get(StoreSetting, "groq_model")
-            if setting:
-                setting.value = model
-            else:
-                db.session.add(StoreSetting(key="groq_model", value=model))
-            messages.append("Groq model saved.")
-        if not messages:
-            return error("No Groq settings were supplied", 400)
+        model = str(payload.get("model", "")).strip()
+        if not model or len(model) > 120 or any(not (char.isalnum() or char in "-_./") for char in model):
+            return error("Choose a valid Groq model ID", 400)
+        setting = db.session.get(StoreSetting, "groq_model")
+        if setting:
+            setting.value = model
+        else:
+            db.session.add(StoreSetting(key="groq_model", value=model))
         db.session.commit()
-        key, source = get_groq_key()
-        return jsonify(configured=bool(key), source=source if key else None,
-                       model=get_groq_model(), message=" ".join(messages))
-
-    @app.post("/api/admin/ai/reveal")
-    @admin_required
-    def reveal_admin_groq_key():
         api_key, _ = get_groq_key()
-        if not api_key:
-            return error("No Groq API key is configured", 404)
-        return jsonify(api_key=api_key)
+        return jsonify(configured=bool(api_key), source="environment" if api_key else None,
+                       model=get_groq_model(), message="Groq model saved.")
 
     @app.post("/api/admin/ai/test")
     @admin_required
@@ -1000,7 +960,7 @@ def create_app(test_config=None):
             return error("Chat history is too long or must end with a user message", 400)
         api_key, _ = get_groq_key()
         if not api_key:
-            return error("Save a Groq API key or set GROQ_API_KEY on the server first", 409)
+            return error("Set GROQ_API_KEY in the Render service environment variables first", 409)
         model = str(payload.get("model") or get_groq_model()).strip()
         if not model or len(model) > 120 or any(not (char.isalnum() or char in "-_./") for char in model):
             return error("Choose a valid Groq model ID", 400)
