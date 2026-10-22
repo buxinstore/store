@@ -52,12 +52,12 @@ def database_uri():
 
 def database_engine_options(uri):
     if uri.startswith(("postgres://", "postgresql://", "postgresql+psycopg://")):
-        # Do not let an unavailable database or a DDL lock hold Gunicorn startup
-        # until Render's port scan times out.
+        # Bound connection attempts so an unavailable database cannot hold
+        # Gunicorn startup until Render's port scan times out. Neon poolers
+        # reject lock_timeout as a startup option, so do not set it here.
         return {
             "connect_args": {
                 "connect_timeout": 10,
-                "options": "-c lock_timeout=10000 -c statement_timeout=30000",
             }
         }
     return {}
