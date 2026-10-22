@@ -162,6 +162,10 @@ def create_app(test_config=None):
                 return "", "admin"
         return os.getenv("GROQ_API_KEY", "").strip(), "environment"
 
+    def get_groq_model():
+        setting = db.session.get(StoreSetting, "groq_model")
+        return setting.value if setting and setting.value else os.getenv("GROQ_MODEL", "openai/gpt-oss-20b").strip()
+
     def shipping_methods():
         setting = db.session.get(StoreSetting, "shipping_methods")
         if not setting:
@@ -875,32 +879,48 @@ def create_app(test_config=None):
     def admin_ai_settings():
         key, source = get_groq_key()
         return jsonify(configured=bool(key), source=source if key else None,
-                       model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"))
+                       model=get_groq_model())
 
     @app.put("/api/admin/ai/settings")
     @admin_required
     def update_admin_ai_settings():
         payload = request.get_json(silent=True) or {}
-        if "api_key" not in payload or not isinstance(payload["api_key"], str):
-            return error("Enter a Groq API key", 400)
-        api_key = payload["api_key"].strip()
-        setting = db.session.get(StoreSetting, "groq_api_key_encrypted")
-        if not api_key:
+        messages = []
+        if "api_key" in payload:
+            if not isinstance(payload["api_key"], str):
+                return error("Groq API key must be text", 400)
+            api_key = payload["api_key"].strip()
+            setting = db.session.get(StoreSetting, "groq_api_key_encrypted")
+            if not api_key:
+                if setting:
+                    db.session.delete(setting)
+                messages.append("Saved key cleared.")
+            else:
+                if len(api_key) > 512 or any(char.isspace() for char in api_key):
+                    return error("The Groq API key format is invalid", 400)
+                encrypted = groq_cipher().encrypt(api_key.encode("utf-8")).decode("utf-8")
+                if setting:
+                    setting.value = encrypted
+                else:
+                    db.session.add(StoreSetting(key="groq_api_key_encrypted", value=encrypted))
+                messages.append("Groq API key saved securely.")
+        if "model" in payload:
+            model = str(payload["model"]).strip()
+            allowed_models = {"openai/gpt-oss-20b", "openai/gpt-oss-120b", "llama-3.1-8b-instant", "llama-3.3-70b-versatile"}
+            if model not in allowed_models:
+                return error("Choose a supported Groq model", 400)
+            setting = db.session.get(StoreSetting, "groq_model")
             if setting:
-                db.session.delete(setting)
-                db.session.commit()
-            key, source = get_groq_key()
-            return jsonify(configured=bool(key), source=source if key else None,
-                           message="Saved key cleared; environment key is used if configured.")
-        if len(api_key) > 512 or any(char.isspace() for char in api_key):
-            return error("The Groq API key format is invalid", 400)
-        encrypted = groq_cipher().encrypt(api_key.encode("utf-8")).decode("utf-8")
-        if setting:
-            setting.value = encrypted
-        else:
-            db.session.add(StoreSetting(key="groq_api_key_encrypted", value=encrypted))
+                setting.value = model
+            else:
+                db.session.add(StoreSetting(key="groq_model", value=model))
+            messages.append("Groq model saved.")
+        if not messages:
+            return error("No Groq settings were supplied", 400)
         db.session.commit()
-        return jsonify(configured=True, source="admin", message="Groq API key saved securely.")
+        key, source = get_groq_key()
+        return jsonify(configured=bool(key), source=source if key else None,
+                       model=get_groq_model(), message=" ".join(messages))
 
     @app.post("/api/admin/ai/reveal")
     @admin_required
@@ -920,7 +940,7 @@ def create_app(test_config=None):
         api_key, _ = get_groq_key()
         if not api_key:
             return error("Save a Groq API key or set GROQ_API_KEY on the server first", 409)
-        model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip()
+        model = get_groq_model()
         body = json.dumps({
             "model": model,
             "messages": [{"role": "user", "content": message.strip()}],
@@ -951,7 +971,7 @@ def create_app(test_config=None):
             if exc.code == 401:
                 return error("Groq rejected the API key. Check that it is valid and active." + suffix, 502)
             if exc.code == 403:
-                return error("Groq denied this request. Check the key's permissions and whether the selected model is available." + suffix, 502)
+                return error(f"Groq denied access to model {model}. Try a Developer-plan model in Admin, or check this key's model permissions." + suffix, 502)
             if exc.code == 429:
                 return error("Groq rate limit or quota reached. Try again later." + suffix, 503)
             return error(f"Groq could not complete the test (HTTP {exc.code})" + suffix, 502)
