@@ -34,7 +34,6 @@ ALLOWED_ORDER_STATUSES = {"pending", "processing", "shipped", "completed", "canc
 PAYMENT_MODES = {"test", "live"}
 PAYMENT_PROVIDERS = {"modem", "paypal"}
 ONLINE_PAYMENT_MESSAGE = "Online payments are not configured for the selected payment mode."
-GROQ_CHAT_MODEL = "openai/gpt-oss-120b"
 DEFAULT_SHIPPING_METHODS = [
     {"id": "dhl", "name": "DHL", "price": "4.99", "enabled": True},
     {"id": "fedex", "name": "FedEx", "price": "4.99", "enabled": True},
@@ -890,11 +889,19 @@ def create_app(test_config=None):
         api_key, _ = get_groq_key()
         if not api_key:
             return error("Set GROQ_API_KEY in the Render service environment variables first", 409)
-        model = GROQ_CHAT_MODEL
-        body = json.dumps({"model": model, "messages": messages}).encode("utf-8")
-        req = Request("https://api.groq.com/openai/v1/chat/completions", data=body,
-                      headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
+        headers = {"Authorization": f"Bearer {api_key}"}
         try:
+            with urlopen(Request("https://api.groq.com/openai/v1/models", headers=headers), timeout=30) as response:
+                model_result = json.loads(response.read().decode("utf-8"))
+            all_models = [item["id"] for item in model_result["data"]]
+            skip = ("whisper", "guard", "tts", "orpheus", "playai", "embed")
+            chat_models = [item for item in all_models if not any(term in item.lower() for term in skip)]
+            if not chat_models:
+                return error("Groq returned no chat-capable models for this API key", 502)
+            model = chat_models[0]
+            body = json.dumps({"model": model, "messages": messages}).encode("utf-8")
+            req = Request("https://api.groq.com/openai/v1/chat/completions", data=body,
+                          headers={**headers, "Content-Type": "application/json"})
             with urlopen(req, timeout=30) as response:
                 result = json.loads(response.read().decode("utf-8"))
             reply = result["choices"][0]["message"]["content"]
@@ -902,7 +909,7 @@ def create_app(test_config=None):
                 raise ValueError("Empty chat response")
             return jsonify(reply=reply, model=model)
         except HTTPError as exc:
-            app.logger.warning("Groq chat request failed with HTTP %s", exc.code)
+            app.logger.warning("Groq %s request failed with HTTP %s", "model-list" if "model" not in locals() else "chat", exc.code)
             try:
                 provider_error = json.loads(exc.read().decode("utf-8", errors="replace"))
                 error_data = provider_error.get("error", {}) if isinstance(provider_error, dict) else {}
@@ -914,10 +921,13 @@ def create_app(test_config=None):
             if exc.code == 401:
                 return error("Groq rejected the API key. Check that it is valid and active." + suffix, 502)
             if exc.code == 403:
-                return error(f"Groq denied access to {model}. Check that Render's GROQ_API_KEY is active and allowed to use this model." + suffix, 502)
+                if "model" not in locals():
+                    return error("Groq denied the model-list request. Check that Render's GROQ_API_KEY is valid and has access to list models." + suffix, 502)
+                return error(f"Groq denied access to the selected chat model {model}." + suffix, 502)
             if exc.code == 429:
                 return error("Groq rate limit or quota reached. Try again later." + suffix, 503)
-            return error(f"Groq could not complete the test (HTTP {exc.code})" + suffix, 502)
+            stage = "model discovery" if "model" not in locals() else "chat request"
+            return error(f"Groq {stage} failed (HTTP {exc.code})" + suffix, 502)
         except (URLError, TimeoutError):
             return error("Could not connect to Groq. Try again shortly.", 502)
         except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError):
