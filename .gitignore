@@ -8,3 +8,4 @@ instance/
 .pytest_cache/
 .ruff_cache/
 backend/.env
+/test.py

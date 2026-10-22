@@ -914,8 +914,10 @@ def create_app(test_config=None):
         try:
             with urlopen(req, timeout=20) as response:
                 result = json.loads(response.read().decode("utf-8"))
-            models = sorted({item.get("id") for item in result.get("data", [])
-                             if isinstance(item, dict) and isinstance(item.get("id"), str)})
+            all_models = sorted({item.get("id") for item in result.get("data", [])
+                                 if isinstance(item, dict) and isinstance(item.get("id"), str)})
+            skip = ("whisper", "guard", "tts", "orpheus", "playai", "embed")
+            models = [model for model in all_models if not any(term in model.lower() for term in skip)]
             return jsonify(models=models)
         except HTTPError as exc:
             detail = groq_error_detail(exc, api_key)
@@ -978,19 +980,31 @@ def create_app(test_config=None):
     @admin_required
     def test_admin_groq_chat():
         payload = request.get_json(silent=True) or {}
-        message = payload.get("message")
-        if not isinstance(message, str) or not message.strip() or len(message) > 2000:
-            return error("Enter a message between 1 and 2,000 characters", 400)
+        submitted_messages = payload.get("messages")
+        if submitted_messages is None:
+            message = payload.get("message")
+            submitted_messages = [{"role": "user", "content": message}] if isinstance(message, str) else None
+        if not isinstance(submitted_messages, list) or not submitted_messages or len(submitted_messages) > 20:
+            return error("Send between 1 and 20 chat messages", 400)
+        messages = [{"role": "system", "content": "You are a helpful assistant."}]
+        total_chars = 0
+        for item in submitted_messages:
+            if not isinstance(item, dict) or item.get("role") not in {"user", "assistant"}:
+                return error("Chat messages must have a user or assistant role", 400)
+            content = item.get("content")
+            if not isinstance(content, str) or not content.strip() or len(content) > 2000:
+                return error("Each chat message must contain 1 to 2,000 characters", 400)
+            total_chars += len(content)
+            messages.append({"role": item["role"], "content": content.strip()})
+        if total_chars > 12000 or messages[-1]["role"] != "user":
+            return error("Chat history is too long or must end with a user message", 400)
         api_key, _ = get_groq_key()
         if not api_key:
             return error("Save a Groq API key or set GROQ_API_KEY on the server first", 409)
-        model = get_groq_model()
-        body = json.dumps({
-            "model": model,
-            "messages": [{"role": "user", "content": message.strip()}],
-            "max_tokens": 400,
-            "temperature": 0.7,
-        }).encode("utf-8")
+        model = str(payload.get("model") or get_groq_model()).strip()
+        if not model or len(model) > 120 or any(not (char.isalnum() or char in "-_./") for char in model):
+            return error("Choose a valid Groq model ID", 400)
+        body = json.dumps({"model": model, "messages": messages}).encode("utf-8")
         req = Request("https://api.groq.com/openai/v1/chat/completions", data=body,
                       headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
         try:
