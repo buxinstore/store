@@ -902,6 +902,14 @@ def create_app(test_config=None):
         db.session.commit()
         return jsonify(configured=True, source="admin", message="Groq API key saved securely.")
 
+    @app.post("/api/admin/ai/reveal")
+    @admin_required
+    def reveal_admin_groq_key():
+        api_key, _ = get_groq_key()
+        if not api_key:
+            return error("No Groq API key is configured", 404)
+        return jsonify(api_key=api_key)
+
     @app.post("/api/admin/ai/test")
     @admin_required
     def test_admin_groq_chat():
@@ -930,11 +938,23 @@ def create_app(test_config=None):
             return jsonify(reply=reply, model=model)
         except HTTPError as exc:
             app.logger.warning("Groq chat request failed with HTTP %s", exc.code)
+            try:
+                provider_error = json.loads(exc.read().decode("utf-8"))
+                detail = provider_error.get("error", {}).get("message", "")
+            except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+                detail = ""
+            if isinstance(detail, str):
+                detail = detail.replace(api_key, "[redacted]").strip()[:500]
+            else:
+                detail = ""
+            suffix = f": {detail}" if detail else ""
             if exc.code == 401:
-                return error("Groq rejected the API key. Check the key and try again.", 502)
+                return error("Groq rejected the API key. Check that it is valid and active." + suffix, 502)
+            if exc.code == 403:
+                return error("Groq denied this request. Check the key's permissions and whether the selected model is available." + suffix, 502)
             if exc.code == 429:
-                return error("Groq rate limit or quota reached. Try again later.", 503)
-            return error(f"Groq could not complete the test (HTTP {exc.code})", 502)
+                return error("Groq rate limit or quota reached. Try again later." + suffix, 503)
+            return error(f"Groq could not complete the test (HTTP {exc.code})" + suffix, 502)
         except (URLError, TimeoutError):
             return error("Could not connect to Groq. Try again shortly.", 502)
         except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError):
