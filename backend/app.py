@@ -24,10 +24,10 @@ from sqlalchemy import inspect, text
 from sqlalchemy.exc import SQLAlchemyError
 from werkzeug.exceptions import RequestEntityTooLarge
 
-from models import Category, Order, OrderItem, PaymentAttempt, Product, StoreSetting, ShippingEstimate, ShippingEstimateHistory, ShippingRefreshJob, ShippingReconciliation, db
+from models import Category, Order, OrderItem, PaymentAttempt, Product, StoreSetting, ShippingEstimate, ShippingEstimateHistory, ShippingRate, ShippingRateHistory, ShippingRefreshJob, ShippingReconciliation, db
 from catalog_seed import seed_starter_catalog
 from shipping import refresh_destinations
-from shipping_core import billable_weight, estimate_is_current, safe_sources
+from shipping_core import billable_weight, estimate_is_current, shipping_charge, shipping_rate_is_current, safe_sources
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
@@ -94,6 +94,16 @@ def create_app(test_config=None):
     app.logger.info("Initializing database schema and migrations")
     with app.app_context():
         db.create_all()
+        # Maintain a database row for every supported country/provider pair;
+        # unresearched rows stay explicitly in manual review with no price.
+        from pycountry import countries
+        present_rates = set(db.session.query(ShippingRate.country_code, ShippingRate.provider).all())
+        for destination in countries:
+            for provider_id in ("dhl", "fedex", "community"):
+                if (destination.alpha_2, provider_id) not in present_rates:
+                    db.session.add(ShippingRate(country_code=destination.alpha_2, country_name=destination.name,
+                        provider=provider_id, status="manual_review"))
+        db.session.commit()
         # AI credentials now come only from the server environment.
         obsolete_groq_settings = [db.session.get(StoreSetting, key)
                                   for key in ("groq_api_key_encrypted", "groq_model")]
@@ -342,7 +352,6 @@ def create_app(test_config=None):
             not str(address.get(field, "")).strip() for field in ("address", "city", "region", "postal_code", "country", "phone")
         ):
             raise ValueError("Enter your name, email, phone, and complete delivery address")
-        estimate = None
         lines = payload.get("items")
         if not isinstance(lines, list) or not lines or len(lines) > 100:
             raise ValueError("Order must include between 1 and 100 items")
@@ -378,26 +387,35 @@ def create_app(test_config=None):
             actual_weight = sum((Decimal(product.weight_kg) * quantity for product, quantity in order_lines), Decimal("0"))
         except (TypeError, InvalidOperation):
             raise ValueError("A product is missing a valid shipping weight; contact support for a manual quote")
-        band = billable_weight(actual_weight)
+        provider = str(payload.get("shipping_provider", "")).strip().lower()
+        if provider not in {"dhl", "fedex", "community"}:
+            raise ValueError("Choose DHL, FedEx, or Community Courier")
+        rate = ShippingRate.query.filter_by(country_code=country_code, provider=provider).with_for_update().first()
+        if not rate or not shipping_rate_is_current(rate):
+            raise ValueError("Shipping requires manual confirmation for this destination and provider; choose another provider or contact support")
         try:
-            estimate_id = int(payload.get("shipping_estimate_id", 0))
+            band, units, shipping = shipping_charge(actual_weight, rate.base_price_usd)
+        except ValueError as exc:
+            raise ValueError("Shipping requires manual confirmation for this destination and provider") from exc
+        try:
+            submitted_rate_id = int(payload.get("shipping_rate_id", 0))
         except (TypeError, ValueError):
-            estimate_id = 0
-        estimate = db.session.get(ShippingEstimate, estimate_id)
-        if not estimate or estimate.country_code != country_code or estimate.weight_kg != band or not estimate_is_current(estimate):
-            raise ValueError("A current shipping estimate is not available for this destination and weight; contact support for a manual quote")
-        shipping = Decimal(estimate.price_usd).quantize(Decimal("0.01"))
-        snapshot = {"estimate_id": estimate.id, "country_code": country_code, "country_name": estimate.country_name,
-                    "actual_weight_kg": str(actual_weight), "billable_weight_kg": str(band), "currency": "USD",
-                    "price_usd": str(shipping), "sources": safe_sources(estimate.sources),
-                    "fx_snapshot": json.loads(estimate.fx_snapshot) if estimate.fx_snapshot else None,
-                    "researched_at": estimate.researched_at.isoformat() if estimate.researched_at else None,
-                    "expires_at": estimate.expires_at.isoformat() if estimate.expires_at else None,
-                    "disclaimer": "Indicative shipping estimate; final carrier charges can vary."}
+            submitted_rate_id = 0
+        if submitted_rate_id != rate.id:
+            raise ValueError("Shipping rate changed; refresh the checkout quote and approve it again")
+        snapshot = {"rate_id": rate.id, "rate_version": rate.rate_version, "country_code": country_code,
+                    "country_name": rate.country_name, "origin": rate.origin, "provider": provider,
+                    "product_weight_kg": str(actual_weight), "billable_weight_kg": str(band),
+                    "base_price_per_0_5kg_usd": str(rate.base_price_usd), "billable_units": units,
+                    "shipping_charge_usd": str(shipping), "currency": "USD", "rate_status": rate.status,
+                    "manual_override": rate.manual_override, "sources": safe_sources(rate.sources),
+                    "researched_at": rate.researched_at.isoformat() if rate.researched_at else None,
+                    "calculated_at": datetime.now(timezone.utc).isoformat(),
+                    "disclaimer": "Shipping amount calculated from the saved provider rate; any extra charge requires your approval."}
         order = Order(
             id=str(uuid4()), customer_name=str(payload["customer_name"]).strip()[:180],
             email=str(payload["email"]).strip()[:254], address=json.dumps({key: str(value).strip() for key, value in address.items()}, ensure_ascii=False),
-            city=str(address["city"]).strip()[:120], postal_code=str(address["postal_code"]).strip()[:32], shipping_method=f"Indicative estimate · {band} kg",
+            city=str(address["city"]).strip()[:120], postal_code=str(address["postal_code"]).strip()[:32], shipping_method=f"{provider.upper()} · {band} kg",
             shipping_snapshot=json.dumps(snapshot), shipping_acknowledged_at=datetime.now(timezone.utc),
             payment_method=payment_method, payment_status="unpaid", status="pending",
             subtotal=subtotal, shipping=shipping, total=subtotal + shipping,
@@ -472,10 +490,13 @@ def create_app(test_config=None):
     def shipping_estimate():
         payload = request.get_json(silent=True) or {}
         country_code = str(payload.get("country_code", "")).strip().upper()
+        provider = str(payload.get("provider", "")).strip().lower()
         from pycountry import countries
         country = countries.get(alpha_2=country_code)
         if not country:
             return error("Choose a supported destination country", 400)
+        if provider not in {"dhl", "fedex", "community"}:
+            return error("Choose DHL, FedEx, or Community Courier", 400)
         lines = payload.get("items")
         if not isinstance(lines, list) or not lines or len(lines) > 100:
             return error("Cart items are required to estimate shipping", 400)
@@ -497,29 +518,33 @@ def create_app(test_config=None):
             band = billable_weight(actual)
         except (KeyError, TypeError, ValueError, InvalidOperation):
             return error("Invalid cart quantities or product weights", 400)
-        row = ShippingEstimate.query.filter_by(country_code=country_code, weight_kg=band).first()
-        if not row or not estimate_is_current(row):
+        row = ShippingRate.query.filter_by(country_code=country_code, provider=provider).first()
+        if not row or not shipping_rate_is_current(row):
             return jsonify(status="manual_review", country_code=country_code, country_name=country.name,
-                           actual_weight_kg=str(actual), billable_weight_kg=str(band),
-                           reason="No current source-backed estimate is available; contact support for a manual quote"), 200
-        return jsonify(status="available", estimate_id=row.id, country_code=country_code, country_name=country.name,
-                       actual_weight_kg=str(actual), billable_weight_kg=str(band), price_usd=str(row.price_usd), currency="USD",
-                       confidence=row.confidence, sources=safe_sources(row.sources), researched_at=row.researched_at.isoformat() if row.researched_at else None,
+                           provider=provider, actual_weight_kg=str(actual), billable_weight_kg=str(band),
+                           reason="Shipping requires confirmation. No current approved rate is available; choose another provider or contact support."), 200
+        billable, units, charge = shipping_charge(actual, row.base_price_usd)
+        return jsonify(status="available", shipping_rate_id=row.id, rate_version=row.rate_version,
+                       provider=provider, country_code=country_code, country_name=country.name,
+                       actual_weight_kg=str(actual), billable_weight_kg=str(billable), billable_units=units,
+                       base_price_per_0_5kg_usd=str(row.base_price_usd), price_usd=str(charge), currency="USD",
+                       confidence=row.confidence, manual_override=row.manual_override, sources=safe_sources(row.sources), researched_at=row.researched_at.isoformat() if row.researched_at else None,
                        expires_at=row.expires_at.isoformat() if row.expires_at else None,
-                       disclaimer="Indicative estimate only. Carrier charges can vary; no additional amount is charged without your approval.")
+                       disclaimer="Calculated from the saved provider price per 0.5 kg. Additional charges require your approval.")
 
     @app.get("/api/admin/shipping")
     @admin_required
     def admin_shipping():
-        rows = ShippingEstimate.query.order_by(ShippingEstimate.country_name, ShippingEstimate.weight_kg).limit(5000).all()
+        rows = ShippingRate.query.order_by(ShippingRate.country_name, ShippingRate.provider).all()
         jobs = ShippingRefreshJob.query.order_by(ShippingRefreshJob.started_at.desc()).limit(20).all()
-        return jsonify(estimates=[{"id": r.id, "country_code": r.country_code, "country_name": r.country_name,
-                                   "weight_kg": str(r.weight_kg), "price_usd": str(r.price_usd) if r.price_usd is not None else None,
-                                   "status": r.status, "confidence": r.confidence, "sources": safe_sources(r.sources),
-                                   "fx_snapshot": json.loads(r.fx_snapshot) if r.fx_snapshot else None,
-                                   "notes": r.notes, "researched_at": r.researched_at.isoformat() if r.researched_at else None,
-                                   "expires_at": r.expires_at.isoformat() if r.expires_at else None, "manual_override": r.manual_override,
-                                   "current": estimate_is_current(r)} for r in rows],
+        return jsonify(rates=[{"id": r.id, "country_code": r.country_code, "country_name": r.country_name,
+                                   "origin": r.origin, "provider": r.provider,
+                                   "base_price_usd": str(r.base_price_usd) if r.base_price_usd is not None else None,
+                                   "rate_version": r.rate_version, "status": r.status, "confidence": r.confidence,
+                                   "sources": safe_sources(r.sources), "notes": r.notes,
+                                   "researched_at": r.researched_at.isoformat() if r.researched_at else None,
+                                   "expires_at": r.expires_at.isoformat() if r.expires_at else None,
+                                   "manual_override": r.manual_override, "current": shipping_rate_is_current(r)} for r in rows],
                        jobs=[{"id": j.id, "status": j.status, "attempted": j.attempted, "succeeded": j.succeeded,
                               "failed": j.failed, "message": j.message, "started_at": j.started_at.isoformat(),
                               "finished_at": j.finished_at.isoformat() if j.finished_at else None} for j in jobs])
@@ -527,9 +552,10 @@ def create_app(test_config=None):
     @app.get("/api/admin/shipping/<int:estimate_id>/history")
     @admin_required
     def admin_shipping_history(estimate_id):
-        if not db.session.get(ShippingEstimate, estimate_id):
-            return error("Shipping estimate not found", 404)
-        rows = ShippingEstimateHistory.query.filter_by(estimate_id=estimate_id).order_by(ShippingEstimateHistory.created_at.desc()).limit(50).all()
+        rate = db.session.get(ShippingRate, estimate_id)
+        if not rate:
+            return error("Shipping rate not found", 404)
+        rows = ShippingRateHistory.query.filter_by(rate_id=estimate_id).order_by(ShippingRateHistory.created_at.desc()).limit(50).all()
         return jsonify(items=[{"snapshot": json.loads(row.snapshot), "created_at": row.created_at.isoformat()} for row in rows])
 
     @app.post("/api/admin/shipping/refresh")
@@ -558,27 +584,28 @@ def create_app(test_config=None):
         code = str(payload.get("country_code", "")).strip().upper()
         country = countries.get(alpha_2=code)
         try:
-            band = Decimal(str(payload.get("weight_kg")))
             price = Decimal(str(payload.get("price_usd"))).quantize(Decimal("0.01"))
-            if not country or band < Decimal("0.5") or band % Decimal("0.5") or price < 0 or price > Decimal("100000"):
+            provider = str(payload.get("provider", "")).strip().lower()
+            if not country or provider not in {"dhl", "fedex", "community"} or price <= 0 or price > Decimal("100000"):
                 raise ValueError
         except (InvalidOperation, TypeError, ValueError):
-            return error("Provide a valid country, 0.5 kg weight band, and USD price", 400)
+            return error("Provide a valid country, provider, and positive USD base price per 0.5 kg", 400)
         source_url = str(payload.get("source_url", "")).strip()
         sources = safe_sources(json.dumps([{"url": source_url, "title": "Manually reviewed source"}])) if source_url else []
         if source_url and not sources:
             return error("Manual source must be an HTTPS URL", 400)
-        row = ShippingEstimate.query.filter_by(country_code=code, weight_kg=band).first()
+        row = ShippingRate.query.filter_by(country_code=code, provider=provider).first()
         if row:
-            db.session.add(ShippingEstimateHistory(estimate_id=row.id, snapshot=json.dumps({"price_usd": str(row.price_usd) if row.price_usd is not None else None, "status": row.status, "sources": row.sources, "researched_at": row.researched_at.isoformat() if row.researched_at else None})))
+            db.session.add(ShippingRateHistory(rate_id=row.id, snapshot=json.dumps({"base_price_usd": str(row.base_price_usd) if row.base_price_usd is not None else None, "status": row.status, "sources": row.sources, "researched_at": row.researched_at.isoformat() if row.researched_at else None, "rate_version": row.rate_version})))
         else:
-            row = ShippingEstimate(country_code=code, weight_kg=band)
+            row = ShippingRate(country_code=code, provider=provider)
             db.session.add(row)
-        row.country_name, row.price_usd, row.status = country.name, price, "available"
-        row.confidence, row.sources, row.fx_snapshot, row.notes = "manual", json.dumps(sources), json.dumps({"currency":"USD","rate":"1","date":datetime.now(timezone.utc).date().isoformat()}), str(payload.get("notes", ""))[:1000]
+        row.country_name, row.origin, row.base_price_usd, row.status = country.name, "Shenzhen, China", price, "available"
+        row.confidence, row.sources, row.notes = "manual", json.dumps(sources), str(payload.get("notes", ""))[:1000]
         row.researched_at, row.expires_at, row.manual_override = datetime.now(timezone.utc), datetime.now(timezone.utc) + timedelta(days=365), True
+        row.rate_version = (row.rate_version or 0) + 1
         db.session.commit()
-        return jsonify(id=row.id, country_code=code, weight_kg=str(band), price_usd=str(price), status=row.status, manual_override=True)
+        return jsonify(id=row.id, country_code=code, provider=provider, base_price_usd=str(price), rate_version=row.rate_version, status=row.status, manual_override=True)
 
     @app.post("/api/orders")
     def create_order():
@@ -586,67 +613,18 @@ def create_app(test_config=None):
         method = str(payload.get("payment_method", "")).strip().lower()
         if method != "cash_on_delivery":
             return error(ONLINE_PAYMENT_MESSAGE, 503)
-        required = ("customer_name", "email", "address", "city", "postal_code")
-        if any(not str(payload.get(field, "")).strip() for field in required):
-            return error("Customer name, email, and shipping address are required", 400)
-        lines = payload.get("items")
-        if not isinstance(lines, list) or not lines:
-            return error("Order must include at least one item", 400)
-        if len(lines) > 100:
-            return error("Order contains too many line items", 400)
-
-        order_lines = []
-        subtotal = Decimal("0.00")
-        requested = {}
         try:
-            for line in lines:
-                product_id = int(line.get("product_id", 0))
-                quantity = int(line.get("quantity", 0))
-                if quantity < 1 or quantity > 99:
-                    return error("Each quantity must be between 1 and 99", 400)
-                requested[product_id] = requested.get(product_id, 0) + quantity
-                if requested[product_id] > 99:
-                    return error("Combined product quantity cannot exceed 99", 400)
-            for product_id, quantity in requested.items():
-                product = Product.query.filter_by(id=product_id, is_active=True).with_for_update().first()
-                if not product:
-                    return error(f"Product {product_id} was not found", 404)
-                if product.stock < quantity:
-                    return error(f"Insufficient stock for {product.name}", 409)
-                subtotal += Decimal(product.price) * quantity
-                order_lines.append((product, quantity))
-        except (AttributeError, TypeError, ValueError):
-            return error("Each item must include a valid product_id and quantity", 400)
-
-        shipping = Decimal("0.00") if subtotal >= Decimal("50.00") else Decimal("4.99")
-        order = Order(
-            id=str(uuid4()),
-            customer_name=str(payload["customer_name"]).strip()[:180],
-            email=str(payload["email"]).strip()[:254],
-            address=str(payload["address"]).strip()[:300],
-            city=str(payload["city"]).strip()[:120],
-            postal_code=str(payload["postal_code"]).strip()[:32],
-            payment_method=method,
-            payment_status="unpaid",
-            status="pending",
-            subtotal=subtotal,
-            shipping=shipping,
-            total=subtotal + shipping,
-        )
-        for product, quantity in order_lines:
-            order.items.append(
-                OrderItem(
-                    product_id=product.id,
-                    product_name=product.name,
-                    image_url=product.image_url,
-                    unit_price=product.price,
-                    quantity=quantity,
-                )
-            )
-            product.stock -= quantity
-        db.session.add(order)
-        try:
+            order = build_order(payload, method)
             db.session.commit()
+        except ValueError as exc:
+            db.session.rollback()
+            return error(str(exc), 400)
+        except LookupError as exc:
+            db.session.rollback()
+            return error(str(exc), 404)
+        except ArithmeticError as exc:
+            db.session.rollback()
+            return error(str(exc), 409)
         except SQLAlchemyError:
             db.session.rollback()
             app.logger.exception("Could not save order")
@@ -753,6 +731,16 @@ def create_app(test_config=None):
                 checkout_url = next((link.get("href") for link in result.get("links", []) if link.get("rel") in {"approve", "payer-action"}), None)
             if not provider_reference or not checkout_url:
                 raise RuntimeError("Payment provider returned an incomplete checkout response")
+            shipping_snapshot = json.loads(order.shipping_snapshot or "{}")
+            shipping_snapshot["payment_conversion"] = ({
+                "currency": "GMD", "usd_to_gmd": str(conversion["usd_to_gmd"]),
+                "rate_date": conversion["rate_date"], "order_total_usd": str(order.total),
+                "provider_amount": str(modem_amount),
+            } if provider == "modem" else {
+                "currency": "USD", "usd_to_usd": "1", "order_total_usd": str(order.total),
+                "provider_amount": str(paypal_amount),
+            })
+            order.shipping_snapshot = json.dumps(shipping_snapshot)
             db.session.add(PaymentAttempt(
                 order_id=order.id, provider=provider, provider_reference=provider_reference,
                 mode=mode, status="pending", frontend_url=frontend_url,

@@ -202,6 +202,36 @@ class ShippingEstimateHistory(db.Model):
     created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow)
 
 
+class ShippingRate(db.Model):
+    """Single approved USD base rate per destination and shipping provider."""
+    __tablename__ = "shipping_rates"
+    __table_args__ = (UniqueConstraint("country_code", "provider", name="uq_shipping_rate_country_provider"),)
+
+    id = db.Column(db.Integer, primary_key=True)
+    country_code = db.Column(db.String(2), nullable=False, index=True)
+    country_name = db.Column(db.String(120), nullable=False)
+    origin = db.Column(db.String(120), nullable=False, default="Shenzhen, China")
+    provider = db.Column(db.String(24), nullable=False)
+    base_price_usd = db.Column(Numeric(10, 2))
+    status = db.Column(db.String(24), nullable=False, default="manual_review")
+    sources = db.Column(db.Text)
+    notes = db.Column(db.Text)
+    confidence = db.Column(db.String(16))
+    researched_at = db.Column(db.DateTime(timezone=True))
+    expires_at = db.Column(db.DateTime(timezone=True))
+    manual_override = db.Column(db.Boolean, nullable=False, default=False)
+    rate_version = db.Column(db.Integer, nullable=False, default=1)
+    updated_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
+
+
+class ShippingRateHistory(db.Model):
+    __tablename__ = "shipping_rate_history"
+    id = db.Column(db.Integer, primary_key=True)
+    rate_id = db.Column(db.Integer, nullable=False, index=True)
+    snapshot = db.Column(db.Text, nullable=False)
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow)
+
+
 class ShippingRefreshJob(db.Model):
     __tablename__ = "shipping_refresh_jobs"
     id = db.Column(db.Integer, primary_key=True)

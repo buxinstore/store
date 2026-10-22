@@ -8,7 +8,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 import requests
-from models import ShippingEstimate, ShippingEstimateHistory, ShippingRefreshJob, ShippingRefreshLock, StoreSetting, db, utcnow
+from models import ShippingEstimate, ShippingEstimateHistory, ShippingRate, ShippingRateHistory, ShippingRefreshJob, ShippingRefreshLock, StoreSetting, db, utcnow
 from sqlalchemy.exc import IntegrityError
 from shipping_core import billable_weight, estimate_is_current, safe_sources
 
@@ -42,7 +42,7 @@ def convert_to_usd(amount, currency):
         return None, None
 
 
-def groq_research(country_name, bands):
+def groq_research(country_name, bands, provider=None):
     """Use Groq's built-in browser search and accept only returned source citations."""
     key = os.getenv("GROQ_API_KEY", "").strip()
     if not key:
@@ -55,6 +55,9 @@ def groq_research(country_name, bands):
         'amount (number or null), currency (3-letter source currency), confidence (low, medium, or high), and notes (string). '
         "Only report a rate when the searched evidence supports it; otherwise amount must be null. Do not include citations or URLs in JSON."
     )
+    if provider:
+        prompt += (f" Research only the {provider} service. Rates must be specifically for {provider} "
+                   "and a 0.5 kg parcel from Shenzhen, China to the destination; do not substitute a different carrier. ")
     body = {
         # Browser search is available to GPT-OSS on Groq. The Admin chat keeps
         # its independent automatic model selection unchanged.
@@ -153,6 +156,43 @@ def save_estimate(country_code, country_name, row):
     return True
 
 
+def save_provider_rate(country_code, country_name, provider, result):
+    """Persist only a cited, validated provider price; retain explicit overrides."""
+    row = ShippingRate.query.filter_by(country_code=country_code, provider=provider).first()
+    if row and row.manual_override:
+        return False
+    if row is None:
+        row = ShippingRate(country_code=country_code, country_name=country_name,
+                           origin="Shenzhen, China", provider=provider)
+        db.session.add(row)
+    else:
+        db.session.add(ShippingRateHistory(rate_id=row.id, snapshot=json.dumps({
+            "base_price_usd": str(row.base_price_usd) if row.base_price_usd is not None else None,
+            "status": row.status, "sources": row.sources, "rate_version": row.rate_version,
+            "researched_at": row.researched_at.isoformat() if row.researched_at else None,
+        })))
+    amount = result.get("amount")
+    sources = safe_sources(json.dumps(result.get("sources", [])))
+    try:
+        parsed_amount = Decimal(str(amount))
+    except (InvalidOperation, TypeError, ValueError):
+        parsed_amount = Decimal("0")
+    valid = parsed_amount.is_finite() and Decimal("0") < parsed_amount <= Decimal("100000") and bool(sources)
+    row.country_name, row.origin = country_name, "Shenzhen, China"
+    row.base_price_usd = parsed_amount.quantize(Decimal("0.01")) if valid else None
+    row.status = "available" if valid else "manual_review"
+    row.sources = json.dumps(sources)
+    row.confidence = result.get("confidence")
+    row.notes = str(result.get("notes", "No verified rate; manual review required."))[:1000]
+    row.researched_at = utcnow()
+    row.expires_at = utcnow() + timedelta(days=int(os.getenv("SHIPPING_ESTIMATE_MAX_AGE_DAYS", "30"))) if valid else None
+    row.manual_override = False
+    row.rate_version = (row.rate_version or 0) + 1
+    # A completed research request is a successful provider check even when
+    # it correctly records manual_review instead of inventing a price.
+    return True
+
+
 def refresh_destinations(destination_codes=None, maximum=None):
     from pycountry import countries
     candidates = list(countries)
@@ -196,20 +236,33 @@ def refresh_destinations(destination_codes=None, maximum=None):
             if daily_used + job.attempted >= daily_limit:
                 job.message = (job.message or "") + "Daily research call budget reached.\n"
                 break
-            fresh = ShippingEstimate.query.filter_by(country_code=country.alpha_2, status="available").filter(ShippingEstimate.expires_at > utcnow()).count()
-            if not destination_codes and fresh >= len(weight_bands()):
+            fresh = ShippingRate.query.filter_by(country_code=country.alpha_2, status="available").filter(ShippingRate.expires_at > utcnow()).count()
+            if not destination_codes and fresh >= 3:
                 continue
             job.attempted += 1
             if not destination_codes:
                 next_cursor = (start_cursor + index + 1) % max(1, len(candidates) if destination_codes else len(list(countries)))
             try:
-                for item in groq_research(country.name, weight_bands()):
-                    save_estimate(country.alpha_2, country.name, item)
-                db.session.commit()
-                job.succeeded += 1
+                for provider in ("dhl", "fedex", "community"):
+                    current = ShippingRate.query.filter_by(country_code=country.alpha_2, provider=provider).first()
+                    if current and current.manual_override:
+                        continue
+                    try:
+                        results = groq_research(country.name, [Decimal("0.5")], provider=provider)
+                        outcome = results[0] if results else {"amount": None, "sources": [], "notes": "No result"}
+                        if save_provider_rate(country.alpha_2, country.name, provider, outcome):
+                            job.succeeded += 1
+                        else:
+                            job.failed += 1
+                        db.session.commit()
+                    except Exception as exc:
+                        db.session.rollback()
+                        job.failed += 1
+                        job.message = (job.message or "") + f"{country.alpha_2}/{provider}: {str(exc)[:240]}\n"
+                        db.session.add(job)
+                        db.session.commit()
             except Exception as exc:
                 db.session.rollback()
-                job.failed += 1
                 job.message = (job.message or "") + f"{country.alpha_2}: {str(exc)[:240]}\n"
                 db.session.add(job)
                 db.session.commit()
