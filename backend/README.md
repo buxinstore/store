@@ -109,7 +109,4 @@ Database changes use safe additive startup migrations, following the existing `d
 
 ### Groq Admin chat
 
-Set `GROQ_API_KEY` only in the Render service environment variables. The Admin page does not save, return, or display this secret; it reports whether the environment variable is configured. On startup, the backend removes any legacy Admin-saved Groq key from `store_settings`, so there is one active source of credentials. `GROQ_MODEL` is optional; Admin can save the selected model separately. The default model is `openai/gpt-oss-20b`.
-
-The Admin chat checks models available to the environment key, filters out speech, moderation, and embedding models, and sends bounded user/assistant conversation history with a fixed helpful-assistant system prompt. The root-level `test.py` is ignored by Git because local provider test scripts may contain credentials.
-The local 	est.py helper reads GROQ_API_KEY from the environment too; do not put provider secrets in source files.
+Set `GROQ_API_KEY` in the Render service environment variables. Admin has no key or model controls: its chat discovers models using that environment key and automatically uses the first chat-capable model returned by Groq, following the local helper script. On startup, the backend removes any legacy Admin-saved Groq key and model from `store_settings`. The bounded chat history uses a fixed helpful-assistant system prompt. The local `test.py` helper reads `GROQ_API_KEY` from the environment; keep provider secrets out of source files.
