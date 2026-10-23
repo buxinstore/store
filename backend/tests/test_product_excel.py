@@ -30,6 +30,22 @@ class ProductExcelTests(unittest.TestCase):
         self.assertEqual(headers, PRODUCT_HEADERS)
         workbook.close()
 
+    def test_legacy_products_and_categories_workbook_with_notes_column(self):
+        workbook = load_workbook(build_product_template())
+        products = workbook["Products"]
+        products["H1"] = "How to use"
+        products["H2"] = "Notes are ignored by the product importer."
+        categories = workbook.create_sheet("Categories")
+        categories.append(["Category"])
+        categories.append(["Sensors"])
+        products.append(["Imported Sensor", "SENSOR-2", "Sensors", 4, 2, None, None, "A row note"])
+        output = BytesIO()
+        workbook.save(output)
+        workbook.close()
+        result = self.parse(output.getvalue())
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(result["products"][0]["name"], "Imported Sensor")
+
     def test_product_and_optional_image_are_parsed(self):
         result = self.parse(self.workbook())
         self.assertEqual(result["errors"], [])

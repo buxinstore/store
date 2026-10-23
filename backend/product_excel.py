@@ -84,25 +84,31 @@ def parse_product_workbook(data, categories, existing_by_sku):
         workbook = load_workbook(BytesIO(data), read_only=True, data_only=False)
     except (zipfile.BadZipFile, OSError, KeyError) as exc:
         raise ValueError("Could not read the .xlsx workbook") from exc
-    if len(workbook.sheetnames) != 1:
+    if "Products" not in workbook.sheetnames or set(workbook.sheetnames) - {"Products", "Categories"}:
         workbook.close()
-        raise ValueError("Workbook must contain exactly one worksheet")
+        raise ValueError("Workbook must contain a Products sheet and may include its Categories sheet")
 
     existing = {str(key).strip().casefold(): value for key, value in (existing_by_sku or {}).items()}
     category_map = {}
     for category in categories:
         category_map[str(category.name).strip().casefold()] = category
         category_map[str(category.slug).strip().casefold()] = category
-    sheet = workbook.active
+    sheet = workbook["Products"]
     for row in sheet.iter_rows():
         for cell in row:
             if cell.data_type == "f":
                 workbook.close()
                 raise ValueError(f"Formula cells are not allowed ({sheet.title}!{cell.coordinate})")
     headers = [str(cell.value or "").strip() for cell in next(sheet.iter_rows(min_row=1, max_row=1))]
-    if len(set(headers)) != len(headers) or headers != PRODUCT_HEADERS:
+    extra_headers = headers[len(PRODUCT_HEADERS):]
+    if headers[:len(PRODUCT_HEADERS)] != PRODUCT_HEADERS or (extra_headers and extra_headers != ["", "How to use"]):
         workbook.close()
-        raise ValueError("Products worksheet headers do not match the downloaded template")
+        raise ValueError("Products sheet must have the six product columns; optional legacy columns are blank and How to use")
+    if "Categories" in workbook.sheetnames:
+        category_sheet = workbook["Categories"]
+        if str(category_sheet.cell(1, 1).value or "").strip().casefold() != "category":
+            workbook.close()
+            raise ValueError("Categories sheet must have a Category header in its first cell")
     if sheet.max_row > MAX_PRODUCTS + 1:
         workbook.close()
         raise ValueError("Workbook contains more than 1,500 product rows")
