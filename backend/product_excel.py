@@ -84,21 +84,21 @@ def parse_product_workbook(data, categories, existing_by_sku):
         workbook = load_workbook(BytesIO(data), read_only=True, data_only=False)
     except (zipfile.BadZipFile, OSError, KeyError) as exc:
         raise ValueError("Could not read the .xlsx workbook") from exc
-    if workbook.sheetnames != ["Products"]:
+    if len(workbook.sheetnames) != 1:
         workbook.close()
-        raise ValueError("Workbook must contain one worksheet named Products")
+        raise ValueError("Workbook must contain exactly one worksheet")
 
     existing = {str(key).strip().casefold(): value for key, value in (existing_by_sku or {}).items()}
     category_map = {}
     for category in categories:
         category_map[str(category.name).strip().casefold()] = category
         category_map[str(category.slug).strip().casefold()] = category
-    sheet = workbook["Products"]
+    sheet = workbook.active
     for row in sheet.iter_rows():
         for cell in row:
             if cell.data_type == "f":
                 workbook.close()
-                raise ValueError(f"Formula cells are not allowed (Products!{cell.coordinate})")
+                raise ValueError(f"Formula cells are not allowed ({sheet.title}!{cell.coordinate})")
     headers = [str(cell.value or "").strip() for cell in next(sheet.iter_rows(min_row=1, max_row=1))]
     if len(set(headers)) != len(headers) or headers != PRODUCT_HEADERS:
         workbook.close()
@@ -116,14 +116,14 @@ def parse_product_workbook(data, categories, existing_by_sku):
             continue
         detected += 1
         row_errors = []
-        name = str(row["Product Name"] or "").strip()
+        name = str(row["Product name"] or "").strip()
         sku = str(row["SKU"] or "").strip().upper()
         category_name = str(row["Category"] or "").strip()
         category = category_map.get(category_name.casefold())
         if not name:
-            row_errors.append("Product Name is required")
+            row_errors.append("Product name is required")
         elif len(name) > 180:
-            row_errors.append("Product Name must be 180 characters or fewer")
+            row_errors.append("Product name must be 180 characters or fewer")
         if not sku:
             row_errors.append("SKU is required")
         elif len(sku) > 100:
