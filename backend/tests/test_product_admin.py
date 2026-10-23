@@ -48,19 +48,14 @@ class ProductAdminTests(unittest.TestCase):
         payload.update(overrides)
         return self.client.post("/api/admin/products", headers=self.headers, json=payload)
 
-    def make_workbook(self, *, duplicate=False, image=True, video=True):
+    def make_workbook(self, *, duplicate=False, image=True):
         output = build_product_template()
         workbook = load_workbook(output)
         sheet = workbook["Products"]
-        sheet.append(["Imported Sensor", "IMPORTED-1", "imported-sensor", "Short", "Full", "Sensors", "", "Maker", "sensor", 3.5, None, "USD", 10, "TRUE", "Active", "TRUE", 0.2, "kg", "TRUE", "MPN-1", "Model-1", "Range: 0 to 100", "", "", "", ""])
+        sheet.append(["Imported Sensor", "IMPORTED-1", "Sensors", 3.5, 10,
+                      "https://images.example.com/front.jpg" if image else None])
         if duplicate:
-            sheet.append(["Duplicate", "imported-1", "duplicate", "", "", "Sensors", "", "", "", 2, None, "USD", 1, "TRUE", "Draft", "FALSE", 0.1, "kg", "TRUE", "", "", "", "", "", "", ""])
-        media = workbook["Images and Videos"]
-        if image:
-            media.append(["IMPORTED-1", "Image", "https://images.example.com/front.jpg", "Front", "TRUE", 0])
-            media.append(["IMPORTED-1", "Image", "https://images.example.com/back.jpg", "Back", "FALSE", 1])
-        if video:
-            media.append(["IMPORTED-1", "Video", "https://youtu.be/abcdefghijk", "Demo", "FALSE", 0])
+            sheet.append(["Duplicate", "imported-1", "Sensors", 2, 1, None])
         result = BytesIO()
         workbook.save(result)
         return result.getvalue()
@@ -87,11 +82,14 @@ class ProductAdminTests(unittest.TestCase):
 
     def test_create_validation_and_case_insensitive_sku_uniqueness(self):
         self.assertEqual(self.create(price=-1).status_code, 400)
+        self.assertEqual(self.client.post("/api/admin/products", headers=self.headers,
+                                          json={"name": "No SKU", "category_id": self.category_id,
+                                                "price": 1, "stock": 1}).status_code, 400)
         self.assertEqual(self.create().status_code, 201)
         duplicate = self.create(name="Other", slug="other", sku="sensor-1")
         self.assertEqual(duplicate.status_code, 409)
 
-    def test_template_preview_import_media_and_repeat_import_by_sku(self):
+    def test_simple_template_preview_import_and_repeat_import_by_sku(self):
         template = self.client.get("/api/admin/products/excel-template", headers=self.headers)
         self.assertEqual(template.status_code, 200)
         self.assertIn("spreadsheetml", template.mimetype)
@@ -101,8 +99,7 @@ class ProductAdminTests(unittest.TestCase):
                                   json={"import_id": preview.get_json()["import_id"], "confirm_import": True})
         self.assertEqual(result.status_code, 200, result.get_json())
         imported = self.client.get("/api/admin/products?q=IMPORTED-1", headers=self.headers).get_json()["items"][0]
-        self.assertEqual(len(imported["media"]), 3)
-        self.assertTrue(imported["media"][0]["is_primary"])
+        self.assertEqual(imported["image_url"], "https://images.example.com/front.jpg")
         repeated = self.preview(self.make_workbook())
         self.assertEqual(repeated.get_json()["preview"]["existing_products_to_update"], 1)
         result2 = self.client.post("/api/admin/products/excel-confirm", headers=self.headers,

@@ -110,6 +110,8 @@ def prepare_product(payload, existing=None):
     sku = str(value("sku", "") or "").strip().upper() or None
     if sku and len(sku) > 100:
         return None, "SKU must be at most 100 characters"
+    if not existing and not sku:
+        return None, "SKU is required"
     metadata = {}
     if existing:
         try:
@@ -1696,23 +1698,17 @@ def create_app(test_config=None):
                 update_data = {"name": row["name"], "slug": row["slug"], "price": row["price"],
                                "stock": row["stock"], "category_id": row["category_id"],
                                "sku": row["sku"] or (product.sku if product else None)}
-                for excel_key, target in (("Short Description", "short_description"), ("Full Description", "description"),
-                                          ("Subcategory", "subcategory"), ("Brand", "brand"), ("Original Price", "compare_at_price")):
-                    if excel_key in provided:
-                        update_data[target] = row[target]
                 if "Product Status" in provided or is_new:
                     update_data["status"] = row["status"]
                 if "Featured" in provided or is_new:
                     update_data["is_featured"] = row["is_featured"]
-                if "Product Weight" in provided:
-                    update_data["weight_kg"] = row["weight_kg"]
                 if row["details"]:
                     update_data["details"] = row["details"]
                 if row["specifications"] is not None:
                     update_data["specifications"] = row["specifications"]
                 if row["tags"] is not None:
                     update_data["tags"] = row["tags"]
-                if "Primary Image URL" in provided:
+                if "Product Image URL" in provided:
                     update_data["image_url"] = row["primary_image_url"] or None
                 candidate, problem = prepare_product(update_data, existing=product)
                 if problem:
