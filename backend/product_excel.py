@@ -10,7 +10,7 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 
 
-PRODUCT_HEADERS = ["Product Name", "SKU", "Category", "Price (USD)", "Stock", "Product Image URL"]
+PRODUCT_HEADERS = ["Product Name", "SKU", "Category", "Price", "Stock", "Product Image"]
 MAX_XLSX_BYTES = 4 * 1024 * 1024
 MAX_UNCOMPRESSED_BYTES = 24 * 1024 * 1024
 MAX_PRODUCTS = 1500
@@ -43,19 +43,8 @@ def _slug(value):
 
 def build_product_template():
     workbook = Workbook()
-    instructions = workbook.active
-    instructions.title = "Instructions"
-    for row in [
-        ["Buxin Store Product Import"],
-        ["Fill in the six columns on Products, then upload the .xlsx file in Admin → Products."],
-        ["Required: Product Name, SKU, Category, Price (USD), and Stock. Product Image URL is optional."],
-        ["Use a category already present in your store. Category names are matched without case sensitivity."],
-        ["Price must be a non-negative USD amount. Stock must be a non-negative whole number."],
-        ["Product Image URL must be a public HTTPS image link. Blank image cells leave an existing image unchanged."],
-        ["SKU updates an existing product; importing the same SKU again will not create a duplicate."],
-    ]:
-        instructions.append(row)
-    products = workbook.create_sheet("Products")
+    products = workbook.active
+    products.title = "Products"
     products.append(PRODUCT_HEADERS)
     products.freeze_panes = "A2"
     products.auto_filter.ref = "A1:F1"
@@ -85,8 +74,9 @@ def parse_product_workbook(data, categories, existing_by_sku):
         workbook = load_workbook(BytesIO(data), read_only=True, data_only=False)
     except (zipfile.BadZipFile, OSError, KeyError) as exc:
         raise ValueError("Could not read the .xlsx workbook") from exc
-    if "Products" not in workbook.sheetnames:
-        raise ValueError("Workbook must include a Products worksheet")
+    if workbook.sheetnames != ["Products"]:
+        workbook.close()
+        raise ValueError("Workbook must contain one worksheet named Products")
 
     existing = {str(key).strip().casefold(): value for key, value in (existing_by_sku or {}).items()}
     category_map = {}
@@ -135,11 +125,11 @@ def parse_product_workbook(data, categories, existing_by_sku):
         if not category:
             row_errors.append(f"Category '{category_name or '(blank)'}' does not match an existing category")
         try:
-            price = float(row["Price (USD)"])
+            price = float(row["Price"])
             if not math.isfinite(price) or price < 0 or price > 99999999.99:
                 raise ValueError
         except (TypeError, ValueError, OverflowError):
-            row_errors.append("Price (USD) must be a non-negative amount")
+            row_errors.append("Price must be a non-negative amount")
             price = 0
         try:
             raw_stock = float(row["Stock"])
@@ -149,9 +139,9 @@ def parse_product_workbook(data, categories, existing_by_sku):
         except (TypeError, ValueError, OverflowError):
             row_errors.append("Stock must be a non-negative whole number")
             stock = 0
-        image_url = safe_image_url(row["Product Image URL"])
-        if row["Product Image URL"] not in (None, "") and not image_url:
-            row_errors.append("Product Image URL must be a public HTTPS URL")
+        image_url = safe_image_url(row["Product Image"])
+        if row["Product Image"] not in (None, "") and not image_url:
+            row_errors.append("Product Image must be a public HTTPS image URL")
         if row_errors:
             errors.extend({"row": row_number, "sheet": "Products", "message": message} for message in row_errors)
             continue
@@ -163,7 +153,7 @@ def parse_product_workbook(data, categories, existing_by_sku):
             "slug": _slug(name),
             "category_id": category.id,
             "category_name": category.name,
-            "price": str(row["Price (USD)"]),
+            "price": str(row["Price"]),
             "stock": stock,
             "primary_image_url": image_url,
             "short_description": "",

@@ -23,9 +23,9 @@ class ProductExcelTests(unittest.TestCase):
     def parse(self, content, existing=None):
         return parse_product_workbook(content, [self.category], existing or {})
 
-    def test_template_is_the_six_field_product_form(self):
+    def test_template_is_one_sheet_with_only_the_six_product_columns(self):
         workbook = load_workbook(build_product_template(), read_only=True, data_only=True)
-        self.assertEqual(workbook.sheetnames, ["Instructions", "Products"])
+        self.assertEqual(workbook.sheetnames, ["Products"])
         headers = [cell.value for cell in next(workbook["Products"].iter_rows(min_row=1, max_row=1))]
         self.assertEqual(headers, PRODUCT_HEADERS)
         workbook.close()
@@ -45,7 +45,7 @@ class ProductExcelTests(unittest.TestCase):
         result = self.parse(self.workbook(("Sensor", "S-2", "Sensors", 3, 1, None)))
         self.assertEqual(result["errors"], [])
         self.assertEqual(result["products"][0]["primary_image_url"], "")
-        self.assertNotIn("Product Image URL", result["products"][0]["provided"])
+        self.assertNotIn("Product Image", result["products"][0]["provided"])
 
     def test_duplicate_sku_and_invalid_category_reported(self):
         result = self.parse(self.workbook(
@@ -63,7 +63,7 @@ class ProductExcelTests(unittest.TestCase):
 
     def test_invalid_private_image_url_is_rejected(self):
         result = self.parse(self.workbook(("Sensor", "S-1", "Sensors", 3, 1, "https://127.0.0.1/private.png")))
-        self.assertTrue(any("Product Image URL" in error["message"] for error in result["errors"]))
+        self.assertTrue(any("Product Image" in error["message"] for error in result["errors"]))
 
     def test_formula_cells_are_rejected(self):
         content = self.workbook()
