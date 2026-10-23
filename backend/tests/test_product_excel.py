@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 from openpyxl import load_workbook
 
-from product_excel import PRODUCT_HEADERS, build_product_template, parse_product_workbook
+from product_excel import PRODUCT_HEADERS, build_product_template, parse_product_workbook, safe_external_url
 
 
 class ProductExcelTests(unittest.TestCase):
@@ -64,6 +64,11 @@ class ProductExcelTests(unittest.TestCase):
     def test_invalid_private_image_url_is_rejected(self):
         result = self.parse(self.workbook(("Sensor", "S-1", "Sensors", 3, 1, "https://127.0.0.1/private.png")))
         self.assertTrue(any("Product Image" in error["message"] for error in result["errors"]))
+
+    def test_existing_media_validator_name_remains_available(self):
+        self.assertTrue(safe_external_url("https://images.example.com/a.png", "image"))
+        self.assertTrue(safe_external_url("https://youtu.be/abcdefghijk", "video"))
+        self.assertFalse(safe_external_url("https://example.com/video.mp4", "video"))
 
     def test_formula_cells_are_rejected(self):
         content = self.workbook()

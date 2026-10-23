@@ -14,6 +14,7 @@ PRODUCT_HEADERS = ["Product Name", "SKU", "Category", "Price", "Stock", "Product
 MAX_XLSX_BYTES = 4 * 1024 * 1024
 MAX_UNCOMPRESSED_BYTES = 24 * 1024 * 1024
 MAX_PRODUCTS = 1500
+ALLOWED_VIDEO_HOSTS = {"youtube.com", "www.youtube.com", "youtu.be", "vimeo.com", "www.vimeo.com", "player.vimeo.com"}
 
 
 def safe_image_url(value):
@@ -35,6 +36,15 @@ def safe_image_url(value):
         return value[:2000]
     except ValueError:
         return ""
+
+
+def safe_external_url(value, kind="image"):
+    """Keep the product-media API's existing validator interface available."""
+    url = safe_image_url(value)
+    if not url or kind != "video":
+        return url if kind == "image" else ""
+    host = (urlsplit(url).hostname or "").lower().rstrip(".")
+    return url if host in ALLOWED_VIDEO_HOSTS else ""
 
 
 def _slug(value):
