@@ -107,6 +107,23 @@ class ProductAdminTests(unittest.TestCase):
         self.assertEqual(result2.status_code, 200, result2.get_json())
         self.assertEqual(self.client.get("/api/admin/products?q=IMPORTED-1", headers=self.headers).get_json()["count"], 1)
 
+    def test_import_resolves_slug_collision_using_sku(self):
+        self.assertEqual(self.create(name="L298N Motor Driver Module", slug="l298n-motor-driver-module",
+                                     sku="EXISTING-1").status_code, 201)
+        book = load_workbook(build_product_template())
+        book["Products"].append(["L298N Motor Driver Module", "NEW-298N", "Sensors", 5, 8, None])
+        output = BytesIO()
+        book.save(output)
+        book.close()
+        preview = self.preview(output.getvalue())
+        self.assertEqual(preview.status_code, 201, preview.get_json())
+        self.assertEqual(preview.get_json()["preview"]["invalid_rows"], 0)
+        confirmed = self.client.post("/api/admin/products/excel-confirm", headers=self.headers,
+                                     json={"import_id": preview.get_json()["import_id"], "confirm_import": True})
+        self.assertEqual(confirmed.status_code, 200, confirmed.get_json())
+        imported = self.client.get("/api/admin/products?q=NEW-298N", headers=self.headers).get_json()["items"][0]
+        self.assertEqual(imported["slug"], "l298n-motor-driver-module-new-298n")
+
     def test_invalid_rows_block_staging_and_preserve_existing_media(self):
         self.assertEqual(self.create(sku="KEEP-1", media=[{"type": "image", "url": "https://images.example.com/keep.jpg", "is_primary": True}]).status_code, 201)
         invalid = self.preview(self.make_workbook(duplicate=True))

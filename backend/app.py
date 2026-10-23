@@ -1640,15 +1640,23 @@ def create_app(test_config=None):
         except ValueError as exc:
             return error(str(exc), 400)
         by_slug = {product.slug: product for product in existing_products}
-        workbook_slugs = set()
+        assigned_slugs = set()
         for row in parsed["products"]:
-            if row["slug"] in workbook_slugs:
-                parsed["errors"].append({"row": row["row"], "sheet": "Products", "message": f"Duplicate slug '{row['slug']}' in workbook"})
-            workbook_slugs.add(row["slug"])
             match = by_sku.get(row["sku"].casefold()) if row["sku"] else by_slug.get(row["slug"])
-            occupied = by_slug.get(row["slug"])
-            if occupied and occupied is not match:
-                parsed["errors"].append({"row": row["row"], "sheet": "Products", "message": f"Slug '{row['slug']}' is already used by another product"})
+            slug = row["slug"]
+            occupied = by_slug.get(slug)
+            if (occupied and occupied is not match) or slug in assigned_slugs:
+                suffix = re.sub(r"[^a-z0-9]+", "-", row["sku"].casefold()).strip("-") or "product"
+                root = slug[:max(1, 199 - len(suffix))].rstrip("-")
+                slug = f"{root}-{suffix}"
+                counter = 2
+                while ((by_slug.get(slug) and by_slug.get(slug) is not match) or slug in assigned_slugs):
+                    ending = f"-{counter}"
+                    root = row["slug"][:max(1, 199 - len(suffix) - len(ending))].rstrip("-")
+                    slug = f"{root}-{suffix}{ending}"
+                    counter += 1
+                row["slug"] = slug
+            assigned_slugs.add(slug)
             if row["sku"] and row["sku"].casefold() in by_sku and match is None:
                 parsed["errors"].append({"row": row["row"], "sheet": "Products", "message": f"SKU '{row['sku']}' is already used"})
         invalid_rows = len({(item.get("sheet", "Products"), item["row"]) for item in parsed["errors"]})
