@@ -72,6 +72,7 @@ Public routes:
 - `GET /api/categories`
 - `GET /api/products?q=&category=&featured=&limit=`
 - `GET /api/products/<id>`
+- `GET /api/products/slug/<slug>`
 - `GET /api/shipping/destinations`, `POST /api/shipping/estimate`
 - `GET /api/shipping-adjustments/<token>`, `POST /api/shipping-adjustments/<token>`
 - `POST /api/orders` (cash on delivery)
@@ -83,15 +84,18 @@ Public routes:
 
 Admin routes require a bearer token from `POST /api/admin/login`:
 
-- `GET /api/admin/products`, `POST /api/admin/products`, `PATCH /api/admin/products/<id>`
+- `GET /api/admin/products` (search/filter/sort/page), `POST /api/admin/products`, `PATCH /api/admin/products/<id>`, `DELETE /api/admin/products/<id>` (archives without removing order history)
+- `GET /api/admin/products/excel-template`, `POST /api/admin/products/excel-preview`, `POST /api/admin/products/excel-confirm`
 - `GET /api/admin/categories`, `POST /api/admin/categories`
 - `GET /api/admin/orders`, `PATCH /api/admin/orders/<order-id>`
 - `GET /api/admin/payment-settings`, `PUT /api/admin/payment-settings`
 - `GET /api/admin/shipping`, `GET /api/admin/shipping/<id>/history`, `PUT /api/admin/shipping/override`, `PUT /api/admin/shipping/mode`, `GET /api/admin/shipping/excel-template`, `POST /api/admin/shipping/excel-preview`, `POST /api/admin/shipping/excel-confirm`
 - `PUT /api/admin/orders/<id>/shipping-reconciliation`, `POST /api/admin/orders/<id>/shipping-reconciliation/resolve`
-- `POST /api/admin/uploads` (`multipart/form-data`, field name `image`)
+- `POST /api/admin/uploads` (`multipart/form-data`, `images` field; Cloudinary-backed, up to 12 images of 5 MB each)
 
 Admin tokens expire after eight hours. Use HTTPS in production. With `API_BASE_URL` configured, the storefront Admin page can sign in to this API, view live product/category/order data, edit product stock, and update order statuses. The login token is kept in the current browser session. Settings and account registration are still frontend demo-only.
+
+Admin → Products supports canonical product creation/editing, status and featured controls, inventory and shipping metadata, category selection/creation, and multiple image/video URLs. Image file uploads require `CLOUDINARY_URL`; video URLs are limited to YouTube/Vimeo embeds. The downloadable product workbook is generated from the import schema and contains `Instructions`, `Products`, and `Images and Videos` sheets. Uploads are validated and staged for one-hour preview/confirmation; SKU identifies updates, invalid rows block confirmation, and blank optional media fields preserve existing media. Archived products remain attached to prior orders and are hidden from public catalog, detail, and checkout queries. Product schema additions are applied by the app's additive database startup migration, preserving existing product/order records.
 
 ## Payments and security
 

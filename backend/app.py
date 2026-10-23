@@ -3,6 +3,7 @@ import hmac
 import hashlib
 import json
 import os
+import re
 import secrets
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -24,10 +25,11 @@ from sqlalchemy import inspect, text
 from sqlalchemy.exc import SQLAlchemyError
 from werkzeug.exceptions import RequestEntityTooLarge
 
-from models import Category, Order, OrderItem, PaymentAttempt, Product, StoreSetting, ShippingEstimate, ShippingEstimateHistory, ShippingRate, ShippingRateHistory, ShippingRefreshJob, ShippingReconciliation, ShippingExcelImport, db
+from models import Category, Order, OrderItem, PaymentAttempt, Product, ProductMedia, ProductExcelImport, StoreSetting, ShippingEstimate, ShippingEstimateHistory, ShippingRate, ShippingRateHistory, ShippingRefreshJob, ShippingReconciliation, ShippingExcelImport, db
 from catalog_seed import seed_starter_catalog
 from shipping_core import billable_weight, estimate_is_current, missing_provider_rate_pairs, shipping_charge, shipping_rate_is_current, safe_sources
 from shipping_excel import build_template, parse_workbook, MAX_XLSX_BYTES
+from product_excel import build_product_template, parse_product_workbook, safe_external_url, MAX_XLSX_BYTES as MAX_PRODUCT_XLSX_BYTES
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
@@ -41,6 +43,183 @@ DEFAULT_SHIPPING_METHODS = [
     {"id": "fedex", "name": "FedEx", "price": "4.99", "enabled": True},
     {"id": "community", "name": "Community courier", "price": "4.99", "enabled": True},
 ]
+
+
+def prepare_product(payload, existing=None):
+    """Validate a create/update payload and return a detached canonical Product."""
+    def value(key, default=None):
+        if key in payload:
+            return payload[key]
+        return getattr(existing, key, default) if existing else default
+
+    def boolean(key, default=False):
+        raw = value(key, default)
+        if isinstance(raw, bool):
+            return raw
+        normalized = str(raw).strip().lower()
+        if normalized in {"true", "yes", "1"}:
+            return True
+        if normalized in {"false", "no", "0", ""}:
+            return False
+        raise ValueError(f"{key} must be true or false")
+
+    try:
+        name = str(value("name", "") or "").strip()
+        slug = re.sub(r"[^a-z0-9]+", "-", str(value("slug", "") or name).strip().lower()).strip("-")[:200]
+        price = Decimal(str(value("price", "")))
+        stock_raw = value("stock", 0)
+        stock = int(stock_raw)
+        category_id = int(value("category_id", 0))
+        weight_raw = value("weight_kg", None)
+        weight = Decimal(str(weight_raw)) if weight_raw not in (None, "") else None
+        compare_raw = value("compare_at_price", None)
+        compare = Decimal(str(compare_raw)) if compare_raw not in (None, "") else None
+        featured = boolean("is_featured", False)
+        active_requested = boolean("is_active", True)
+    except (TypeError, ValueError, InvalidOperation, OverflowError):
+        return None, "Valid name, price, stock, and category are required"
+    category = db.session.get(Category, category_id)
+    if not name or len(name) > 180 or not slug:
+        return None, "Product name is required and must be at most 180 characters"
+    if not category:
+        return None, "Select an existing product category"
+    if not price.is_finite() or price < 0 or price > Decimal("99999999.99"):
+        return None, "Selling price must be a valid non-negative USD amount"
+    if compare is not None and (not compare.is_finite() or compare < price or compare > Decimal("99999999.99")):
+        return None, "Original price must be a valid amount at least as high as the selling price"
+    if stock < 0 or stock > 2147483647 or str(stock_raw).strip() != str(stock):
+        return None, "Stock quantity must be a non-negative whole number in the supported range"
+    if weight is not None and (not weight.is_finite() or weight <= 0 or weight > 1000):
+        return None, "Product weight must be between 0 and 1000 kg"
+
+    status = str(value("status", "active") or "active").strip().lower()
+    if "status" not in payload and "is_active" in payload:
+        status = "active" if payload["is_active"] else "inactive"
+    if status not in {"draft", "active", "inactive", "archived"}:
+        return None, "Product status must be Draft, Active, Inactive, or Archived"
+    active = status == "active" if "status" in payload or not existing else active_requested
+    if status == "active" and not active:
+        status = "inactive"
+    elif status == "inactive" and active_requested and "is_active" in payload and "status" not in payload:
+        status = "active"
+    image_url = value("image_url", None)
+    if image_url:
+        image_url = str(image_url).strip()
+        if not (safe_external_url(image_url, "image") or (image_url.startswith("assets/") and ".." not in image_url.split("/"))):
+            return None, "Product image must use HTTPS or a safe assets/ path"
+    sku = str(value("sku", "") or "").strip().upper() or None
+    if sku and len(sku) > 100:
+        return None, "SKU must be at most 100 characters"
+    metadata = {}
+    if existing:
+        try:
+            metadata = json.loads(existing.metadata_json or "{}")
+            if not isinstance(metadata, dict):
+                metadata = {}
+        except (TypeError, ValueError):
+            metadata = {}
+    if "details" in payload:
+        if not isinstance(payload["details"], dict):
+            return None, "Product details must be an object"
+        details = payload["details"]
+        allowed_details = {"manufacturer_part_number", "model_number", "datasheet_url", "warranty_information", "country_of_origin", "track_inventory", "shipping_required", "weight_unit"}
+        if set(details) - allowed_details:
+            return None, "Product details include an unsupported field"
+        clean_details = {}
+        for key, raw in details.items():
+            if key == "datasheet_url":
+                url = str(raw or "").strip()
+                if url and not safe_external_url(url, "image"):
+                    return None, "Datasheet URL must be a safe HTTPS URL"
+                clean_details[key] = url
+            elif key in {"track_inventory", "shipping_required"}:
+                if isinstance(raw, bool):
+                    clean_details[key] = raw
+                elif str(raw).strip().lower() in {"true", "yes", "1"}:
+                    clean_details[key] = True
+                elif str(raw).strip().lower() in {"false", "no", "0"}:
+                    clean_details[key] = False
+                else:
+                    return None, f"{key.replace('_', ' ').capitalize()} must be true or false"
+            else:
+                clean_details[key] = str(raw or "").strip()[:1000]
+        metadata.update(clean_details)
+    if "tags" in payload:
+        tags = payload["tags"]
+        if not isinstance(tags, list) or len(tags) > 50:
+            return None, "Tags must be a list with at most 50 entries"
+        metadata["tags"] = [str(tag).strip()[:80] for tag in tags if str(tag).strip()]
+    if "specifications" in payload:
+        if not isinstance(payload["specifications"], dict) or len(payload["specifications"]) > 80:
+            return None, "Specifications must be a key/value object with at most 80 entries"
+        metadata["specifications"] = {str(key)[:100]: str(val)[:500] for key, val in payload["specifications"].items()}
+    product = Product(
+        name=name[:180], slug=slug, short_description=str(value("short_description", "") or "")[:500],
+        description=str(value("description", "") or "")[:50000], price=price, compare_at_price=compare,
+        image_url=image_url, cloudinary_public_id=value("cloudinary_public_id", None), sku=sku,
+        brand=(str(value("brand", "") or "").strip()[:120] or None),
+        subcategory=(str(value("subcategory", "") or "").strip()[:120] or None),
+        stock=stock, weight_kg=weight, category_id=category.id, status=status, is_active=active,
+        is_featured=featured, metadata_json=json.dumps(metadata, ensure_ascii=False),
+    )
+    return product, None
+
+
+def replace_product_media(product, media_items):
+    if not isinstance(media_items, list) or len(media_items) > 60:
+        return "Product media must be a list of at most 60 items"
+    normalized = []
+    image_count = video_count = 0
+    for index, item in enumerate(media_items):
+        if not isinstance(item, dict):
+            return "Each media item must be an object"
+        kind = str(item.get("type", "image")).strip().lower()
+        if kind not in {"image", "video"}:
+            return "Media type must be Image or Video"
+        image_count += kind == "image"
+        video_count += kind == "video"
+        url = safe_external_url(item.get("url"), kind)
+        if not url:
+            return "Media URL must use HTTPS; video URLs must be from YouTube or Vimeo"
+        primary_raw = item.get("is_primary", item.get("primary", False))
+        if isinstance(primary_raw, bool):
+            primary = primary_raw
+        elif str(primary_raw).strip().lower() in {"true", "yes", "1"}:
+            primary = True
+        elif str(primary_raw).strip().lower() in {"false", "no", "0", ""}:
+            primary = False
+        else:
+            return "Primary image must be true or false"
+        try:
+            order = int(item.get("display_order", item.get("order", index)) or 0)
+            if order < 0 or order > 10000:
+                raise ValueError
+        except (TypeError, ValueError, OverflowError):
+            return "Media display order must be a non-negative whole number"
+        normalized.append({"type": kind, "url": url, "title": str(item.get("title") or "")[:240],
+                           "alt_text": str(item.get("alt_text") or item.get("title") or product.name)[:300],
+                           "primary": primary and kind == "image", "order": order})
+    if image_count > 50 or video_count > 10:
+        return "A product can have up to 50 images and 10 videos"
+    primary_images = [item for item in normalized if item["primary"]]
+    for item in primary_images[1:]:
+        item["primary"] = False
+    if not primary_images:
+        first = next((item for item in normalized if item["type"] == "image"), None)
+        if first:
+            first["primary"] = True
+    for old in list(product.media):
+        db.session.delete(old)
+    product.media.clear()
+    for item in normalized:
+        product.media.append(ProductMedia(product=product, media_type=item["type"], url=item["url"], title=item["title"] or None,
+                                          alt_text=item["alt_text"], is_primary=item["primary"], display_order=item["order"]))
+    primary = next((item for item in normalized if item["type"] == "image" and item["primary"]), None)
+    if primary:
+        product.image_url = primary["url"]
+    elif not any(item["type"] == "image" for item in normalized):
+        product.image_url = None
+    return None
 
 
 def database_uri():
@@ -73,7 +252,8 @@ def create_app(test_config=None):
         SQLALCHEMY_DATABASE_URI=db_uri,
         SQLALCHEMY_ENGINE_OPTIONS=database_engine_options(db_uri),
         SQLALCHEMY_TRACK_MODIFICATIONS=False,
-        MAX_CONTENT_LENGTH=int(os.getenv("MAX_CONTENT_LENGTH", 5 * 1024 * 1024)),
+        # Product media may contain up to twelve 5 MB images in one request.
+        MAX_CONTENT_LENGTH=int(os.getenv("MAX_CONTENT_LENGTH", 65 * 1024 * 1024)),
         ADMIN_TOKEN_TTL_SECONDS=8 * 60 * 60,
     )
     if test_config:
@@ -129,6 +309,24 @@ def create_app(test_config=None):
         if "weight_kg" not in product_columns:
             with db.engine.begin() as connection:
                 connection.execute(text("ALTER TABLE products ADD COLUMN weight_kg NUMERIC(8, 3)"))
+        product_migrations = {
+            "short_description": "VARCHAR(500) NOT NULL DEFAULT ''",
+            "brand": "VARCHAR(120)",
+            "subcategory": "VARCHAR(120)",
+            "status": "VARCHAR(16) NOT NULL DEFAULT 'active'",
+            "metadata_json": "TEXT NOT NULL DEFAULT '{}'",
+        }
+        for column, sql_type in product_migrations.items():
+            if column not in product_columns:
+                with db.engine.begin() as connection:
+                    connection.execute(text(f"ALTER TABLE products ADD COLUMN {column} {sql_type}"))
+        if "status" not in product_columns:
+            with db.engine.begin() as connection:
+                connection.execute(text("UPDATE products SET status = CASE WHEN is_active THEN 'active' ELSE 'inactive' END"))
+        item_columns = {column["name"] for column in inspect(db.engine).get_columns("order_items")}
+        if "inventory_tracked" not in item_columns:
+            with db.engine.begin() as connection:
+                connection.execute(text("ALTER TABLE order_items ADD COLUMN inventory_tracked BOOLEAN NOT NULL DEFAULT TRUE"))
         estimate_columns = {column["name"] for column in inspect(db.engine).get_columns("shipping_estimates")}
         if "fx_snapshot" not in estimate_columns:
             with db.engine.begin() as connection:
@@ -401,10 +599,10 @@ def create_app(test_config=None):
         order_lines = []
         subtotal = Decimal("0.00")
         for product_id, quantity in requested.items():
-            product = Product.query.filter_by(id=product_id, is_active=True).with_for_update().first()
+            product = Product.query.filter_by(id=product_id, is_active=True, status="active").with_for_update().first()
             if not product:
                 raise LookupError(f"Product {product_id} was not found")
-            if product.stock < quantity:
+            if product.metadata_value("track_inventory", True) and product.stock < quantity:
                 raise ArithmeticError(f"Insufficient stock for {product.name}")
             subtotal += Decimal(product.price) * quantity
             order_lines.append((product, quantity))
@@ -452,8 +650,10 @@ def create_app(test_config=None):
             order.items.append(OrderItem(
                 product_id=product.id, product_name=product.name, image_url=product.image_url,
                 unit_price=product.price, quantity=quantity,
+                inventory_tracked=product.metadata_value("track_inventory", True),
             ))
-            product.stock -= quantity
+            if product.metadata_value("track_inventory", True):
+                product.stock -= quantity
         db.session.add(order)
         order.shipping_reconciliation = ShippingReconciliation(order_id=order.id, quoted_usd=shipping, status="awaiting_final_cost")
         return order
@@ -462,7 +662,7 @@ def create_app(test_config=None):
         for item in order.items:
             if item.product_id:
                 product = db.session.get(Product, item.product_id)
-                if product:
+                if product and getattr(item, "inventory_tracked", True):
                     product.stock += item.quantity
         order.status = "cancelled"
         order.payment_status = "failed"
@@ -484,27 +684,38 @@ def create_app(test_config=None):
 
     @app.get("/api/products")
     def products():
-        query = Product.query.join(Category).filter(Product.is_active.is_(True), Category.is_active.is_(True))
+        query = Product.query.join(Category).filter(Product.is_active.is_(True), Product.status == "active", Category.is_active.is_(True))
         category = request.args.get("category", "").strip()
         search = request.args.get("q", "").strip()
         if category:
             query = query.filter(Category.slug == category)
         if search:
             like = f"%{search[:100]}%"
-            query = query.filter((Product.name.ilike(like)) | (Product.description.ilike(like)))
+            query = query.filter((Product.name.ilike(like)) | (Product.description.ilike(like)) | (Product.short_description.ilike(like)) | (Product.sku.ilike(like)) | (Product.brand.ilike(like)) | (Product.metadata_json.ilike(like)))
         featured = request.args.get("featured") == "true"
         if featured:
             query = query.filter(Product.is_featured.is_(True))
         try:
             limit = min(max(int(request.args.get("limit", 100)), 1), 200)
+            page_no = max(1, int(request.args.get("page", 1)))
         except ValueError:
-            limit = 100
-        rows = query.order_by(Product.is_featured.desc(), Product.name).limit(limit).all()
-        return jsonify(items=[row.to_dict() for row in rows], count=len(rows))
+            limit, page_no = 100, 1
+        count = query.count()
+        rows = query.order_by(Product.is_featured.desc(), Product.name).offset((page_no - 1) * limit).limit(limit).all()
+        return jsonify(items=[row.to_dict() for row in rows], count=count, page=page_no,
+                       per_page=limit, pages=(count + limit - 1) // limit)
 
     @app.get("/api/products/<int:product_id>")
     def product_detail(product_id):
-        row = Product.query.filter_by(id=product_id, is_active=True).first()
+        row = Product.query.join(Category).filter(Product.id == product_id, Product.is_active.is_(True), Product.status == "active", Category.is_active.is_(True)).first()
+        if not row:
+            return error("Product not found", 404)
+        return jsonify(item=row.to_dict())
+
+    @app.get("/api/products/slug/<path:slug>")
+    def product_detail_by_slug(slug):
+        row = Product.query.join(Category).filter(Product.slug == slug, Product.is_active.is_(True),
+                                                  Product.status == "active", Category.is_active.is_(True)).first()
         if not row:
             return error("Product not found", 404)
         return jsonify(item=row.to_dict())
@@ -535,7 +746,7 @@ def create_app(test_config=None):
                 if not 1 <= quantity <= 99:
                     raise ValueError
                 quantities[product_id] = quantities.get(product_id, 0) + quantity
-            products = {p.id: p for p in Product.query.filter(Product.id.in_(quantities), Product.is_active.is_(True)).all()}
+            products = {p.id: p for p in Product.query.filter(Product.id.in_(quantities), Product.is_active.is_(True), Product.status == "active").all()}
             if set(products) != set(quantities):
                 return error("A cart item is no longer available", 409)
             actual = Decimal("0")
@@ -1320,14 +1531,18 @@ def create_app(test_config=None):
     def create_category():
         payload = request.get_json(silent=True) or {}
         name = str(payload.get("name", "")).strip()
-        slug = str(payload.get("slug", "")).strip().lower()
+        slug = re.sub(r"[^a-z0-9]+", "-", str(payload.get("slug", "") or name).strip().lower()).strip("-")
         if not name or not slug:
-            return error("Category name and slug are required", 400)
-        if Category.query.filter_by(slug=slug).first():
-            return error("Category slug already exists", 409)
+            return error("Category name is required", 400)
+        if Category.query.filter(db.func.lower(Category.name) == name.casefold()).first() or Category.query.filter_by(slug=slug).first():
+            return error("A category with this name or URL already exists", 409)
         category = Category(name=name[:120], slug=slug[:140], description=str(payload.get("description", ""))[:500])
         db.session.add(category)
-        db.session.commit()
+        try:
+            db.session.commit()
+        except SQLAlchemyError:
+            db.session.rollback()
+            return error("Could not save this category; check its name and slug", 409)
         return jsonify(item=category.to_dict()), 201
 
     @app.get("/api/admin/categories")
@@ -1340,43 +1555,216 @@ def create_app(test_config=None):
     @admin_required
     def create_product():
         payload = request.get_json(silent=True) or {}
-        try:
-            name = str(payload.get("name", "")).strip()
-            slug = str(payload.get("slug", "")).strip().lower()
-            price = Decimal(str(payload.get("price", "")))
-            stock = int(payload.get("stock", 0))
-            category_id = int(payload.get("category_id", 0))
-            weight_kg = Decimal(str(payload["weight_kg"])) if payload.get("weight_kg") not in (None, "") else None
-        except (TypeError, ValueError, InvalidOperation):
-            return error("Valid name, slug, price, stock, and category_id are required", 400)
-        category = db.session.get(Category, category_id)
-        if not name or not slug or price < 0 or stock < 0 or not category or (weight_kg is not None and (weight_kg <= 0 or weight_kg > 1000)):
-            return error("Product details or category are invalid", 400)
-        if Product.query.filter_by(slug=slug).first():
+        product, problem = prepare_product(payload)
+        if problem:
+            return error(problem, 400)
+        if Product.query.filter_by(slug=product.slug).first():
             return error("Product slug already exists", 409)
-        product = Product(
-            name=name[:180],
-            slug=slug[:200],
-            description=str(payload.get("description", "")),
-            price=price,
-            compare_at_price=payload.get("compare_at_price"),
-            image_url=payload.get("image_url"),
-            cloudinary_public_id=payload.get("cloudinary_public_id"),
-            sku=payload.get("sku"),
-            stock=stock,
-            weight_kg=weight_kg,
-            category=category,
-            is_featured=bool(payload.get("is_featured", False)),
-        )
+        if product.sku and Product.query.filter(db.func.lower(Product.sku) == product.sku.casefold()).first():
+            return error("SKU already exists", 409)
         db.session.add(product)
-        db.session.commit()
+        db.session.flush()
+        if "media" in payload:
+            problem = replace_product_media(product, payload["media"])
+            if problem:
+                db.session.rollback()
+                return error(problem, 400)
+        elif product.image_url:
+            db.session.add(ProductMedia(product=product, media_type="image", url=product.image_url, is_primary=True, alt_text=product.name))
+        try:
+            db.session.commit()
+        except SQLAlchemyError:
+            db.session.rollback()
+            return error("Could not save product; check that its SKU and URL are unique", 409)
         return jsonify(item=product.to_dict()), 201
 
     @app.get("/api/admin/products")
     @admin_required
     def admin_products():
-        rows = Product.query.join(Category).order_by(Product.name).all()
-        return jsonify(items=[row.to_dict() for row in rows], count=len(rows))
+        query = Product.query.join(Category)
+        search = request.args.get("q", "").strip()[:100]
+        if search:
+            pattern = f"%{search}%"
+            query = query.filter(db.or_(Product.name.ilike(pattern), Product.sku.ilike(pattern), Product.brand.ilike(pattern), Category.name.ilike(pattern)))
+        category = request.args.get("category", "").strip()
+        if category:
+            try:
+                query = query.filter(Product.category_id == int(category))
+            except ValueError:
+                query = query.filter(Category.slug == category)
+        status = request.args.get("status", "").strip().lower()
+        if status in {"draft", "active", "inactive", "archived"}:
+            query = query.filter(Product.status == status)
+        availability = request.args.get("availability", "").strip().lower()
+        if availability == "in_stock":
+            query = query.filter(Product.stock > 0)
+        elif availability == "out_of_stock":
+            query = query.filter(Product.stock <= 0)
+        sort = request.args.get("sort", "name")
+        sort_columns = {"name": Product.name, "price": Product.price, "stock": Product.stock, "created": Product.created_at}
+        sort_column = sort_columns.get(sort, Product.name)
+        order = sort_column.desc() if request.args.get("direction") == "desc" else sort_column.asc()
+        try:
+            page_no = max(1, int(request.args.get("page", 1)))
+            page_size = min(100, max(1, int(request.args.get("per_page", 1000))))
+        except ValueError:
+            page_no, page_size = 1, 1000
+        count = query.count()
+        rows = query.order_by(order, Product.id).offset((page_no - 1) * page_size).limit(page_size).all()
+        return jsonify(items=[row.to_dict() for row in rows], count=count, page=page_no,
+                       per_page=page_size, pages=(count + page_size - 1) // page_size)
+
+    @app.get("/api/admin/products/excel-template")
+    @admin_required
+    def admin_products_excel_template():
+        output = build_product_template()
+        return send_file(output, mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                         as_attachment=True, download_name="buxin-product-import-template.xlsx")
+
+    @app.post("/api/admin/products/excel-preview")
+    @admin_required
+    def admin_products_excel_preview():
+        upload = request.files.get("file")
+        if not upload or not upload.filename or not upload.filename.lower().endswith(".xlsx"):
+            return error("Choose an .xlsx product workbook", 400)
+        content = upload.stream.read(MAX_PRODUCT_XLSX_BYTES + 1)
+        if len(content) > MAX_PRODUCT_XLSX_BYTES:
+            return error("Product workbook is larger than 4 MB", 413)
+        categories = Category.query.filter_by(is_active=True).order_by(Category.name).all()
+        existing_products = Product.query.all()
+        by_sku = {product.sku.casefold(): product for product in existing_products if product.sku}
+        try:
+            parsed = parse_product_workbook(content, categories, by_sku)
+        except ValueError as exc:
+            return error(str(exc), 400)
+        by_slug = {product.slug: product for product in existing_products}
+        workbook_slugs = set()
+        for row in parsed["products"]:
+            if row["slug"] in workbook_slugs:
+                parsed["errors"].append({"row": row["row"], "sheet": "Products", "message": f"Duplicate slug '{row['slug']}' in workbook"})
+            workbook_slugs.add(row["slug"])
+            match = by_sku.get(row["sku"].casefold()) if row["sku"] else by_slug.get(row["slug"])
+            occupied = by_slug.get(row["slug"])
+            if occupied and occupied is not match:
+                parsed["errors"].append({"row": row["row"], "sheet": "Products", "message": f"Slug '{row['slug']}' is already used by another product"})
+            if row["sku"] and row["sku"].casefold() in by_sku and match is None:
+                parsed["errors"].append({"row": row["row"], "sheet": "Products", "message": f"SKU '{row['sku']}' is already used"})
+        invalid_rows = len({(item.get("sheet", "Products"), item["row"]) for item in parsed["errors"]})
+        update_ids = set()
+        for row in parsed["products"]:
+            matched = by_sku.get(row["sku"].casefold()) if row["sku"] else by_slug.get(row["slug"])
+            if matched:
+                update_ids.add(matched.id)
+        preview = {"rows_detected": parsed["rows_detected"], "new_products": max(0, len(parsed["products"]) - len(update_ids)),
+                   "existing_products_to_update": len(update_ids), "invalid_rows": invalid_rows,
+                   "errors": parsed["errors"], "media_records": len(parsed["media"]),
+                   "media_needing_attention": sum(1 for item in parsed["errors"] if item.get("sheet") == "Images and Videos"),
+                   "sku_updates": sum(1 for row in parsed["products"] if row["sku"] and row["sku"].casefold() in by_sku)}
+        import_id = None
+        if not invalid_rows:
+            staged = ProductExcelImport(id=str(uuid4()), payload=json.dumps(parsed), preview=json.dumps(preview), created_at=datetime.now(timezone.utc))
+            db.session.add(staged)
+            db.session.commit()
+            import_id = staged.id
+        return jsonify(import_id=import_id, preview=preview), 201
+
+    @app.post("/api/admin/products/excel-confirm")
+    @admin_required
+    def admin_products_excel_confirm():
+        payload = request.get_json(silent=True) or {}
+        if payload.get("confirm_import") is not True:
+            return error("Explicitly confirm the reviewed product import", 400)
+        staged = ProductExcelImport.query.filter_by(id=str(payload.get("import_id", ""))).with_for_update().first()
+        if not staged or staged.consumed_at:
+            return error("This product preview expired or was already imported. Upload the workbook again.", 409)
+        created_at = staged.created_at.replace(tzinfo=timezone.utc) if staged.created_at.tzinfo is None else staged.created_at
+        if created_at < datetime.now(timezone.utc) - timedelta(hours=1):
+            return error("This product preview expired. Upload the workbook again.", 409)
+        parsed = json.loads(staged.payload)
+        preview = json.loads(staged.preview)
+        if preview.get("invalid_rows"):
+            return error("Correct every invalid row and upload the workbook again", 400)
+        existing_products = Product.query.with_for_update().all()
+        by_sku = {product.sku.casefold(): product for product in existing_products if product.sku}
+        by_slug = {product.slug: product for product in existing_products}
+        changes = {"created": [], "updated": [], "media_added": 0}
+        try:
+            for row in parsed["products"]:
+                product = by_sku.get(row["sku"].casefold()) if row["sku"] else by_slug.get(row["slug"])
+                is_new = product is None
+                provided = set(row.get("provided", []))
+                update_data = {"name": row["name"], "slug": row["slug"], "price": row["price"],
+                               "stock": row["stock"], "category_id": row["category_id"],
+                               "sku": row["sku"] or (product.sku if product else None)}
+                for excel_key, target in (("Short Description", "short_description"), ("Full Description", "description"),
+                                          ("Subcategory", "subcategory"), ("Brand", "brand"), ("Original Price", "compare_at_price")):
+                    if excel_key in provided:
+                        update_data[target] = row[target]
+                if "Product Status" in provided or is_new:
+                    update_data["status"] = row["status"]
+                if "Featured" in provided or is_new:
+                    update_data["is_featured"] = row["is_featured"]
+                if "Product Weight" in provided:
+                    update_data["weight_kg"] = row["weight_kg"]
+                if row["details"]:
+                    update_data["details"] = row["details"]
+                if row["specifications"] is not None:
+                    update_data["specifications"] = row["specifications"]
+                if row["tags"] is not None:
+                    update_data["tags"] = row["tags"]
+                if "Primary Image URL" in provided:
+                    update_data["image_url"] = row["primary_image_url"] or None
+                candidate, problem = prepare_product(update_data, existing=product)
+                if problem:
+                    raise ValueError(f"Row {row['row']}: {problem}")
+                if is_new:
+                    product = candidate
+                    db.session.add(product)
+                    db.session.flush()
+                    by_slug[product.slug] = product
+                    if product.sku:
+                        by_sku[product.sku.casefold()] = product
+                else:
+                    for field in ("name", "slug", "short_description", "description", "price", "compare_at_price", "image_url", "sku", "brand", "subcategory", "status", "stock", "weight_kg", "is_active", "is_featured", "category_id", "metadata_json"):
+                        setattr(product, field, getattr(candidate, field))
+                    by_slug[product.slug] = product
+                    if product.sku:
+                        by_sku[product.sku.casefold()] = product
+                if row["primary_image_url"]:
+                    primary = next((item for item in product.media if item.media_type == "image" and item.url == row["primary_image_url"]), None)
+                    for item in product.media:
+                        if item.media_type == "image":
+                            item.is_primary = item is primary
+                    if not primary:
+                        primary = ProductMedia(product=product, media_type="image", url=row["primary_image_url"], alt_text=product.name, is_primary=True, display_order=0)
+                        db.session.add(primary)
+                changes["created" if is_new else "updated"].append({"sku": product.sku, "name": product.name, "id": product.id})
+            for media_row in parsed["media"]:
+                product = by_sku.get(media_row["sku"].casefold())
+                if not product:
+                    raise ValueError(f"Media SKU '{media_row['sku']}' is no longer present; preview the workbook again")
+                if any(item.media_type == media_row["type"] and item.url == media_row["url"] for item in product.media):
+                    continue
+                make_primary = media_row["primary"] or (media_row["type"] == "image" and not any(item.media_type == "image" and item.is_primary for item in product.media))
+                if make_primary and media_row["type"] == "image":
+                    for item in product.media:
+                        if item.media_type == "image":
+                            item.is_primary = False
+                db.session.add(ProductMedia(product=product, media_type=media_row["type"], url=media_row["url"],
+                                            title=media_row["title"] or None, alt_text=media_row["title"] or product.name,
+                                            is_primary=make_primary, display_order=media_row["order"]))
+                if make_primary and media_row["type"] == "image":
+                    product.image_url = media_row["url"]
+                changes["media_added"] += 1
+            staged.consumed_at = datetime.now(timezone.utc)
+            db.session.commit()
+        except (ValueError, SQLAlchemyError) as exc:
+            db.session.rollback()
+            if isinstance(exc, SQLAlchemyError):
+                app.logger.exception("Product Excel import failed atomically")
+                return error("Import could not be saved; no product changes were applied", 409)
+            return error(str(exc), 400)
+        return jsonify(message=f"Imported {len(changes['created'])} new products and updated {len(changes['updated'])} existing products.", changes=changes)
 
     @app.patch("/api/admin/products/<int:product_id>")
     @admin_required
@@ -1385,56 +1773,85 @@ def create_app(test_config=None):
         if not product:
             return error("Product not found", 404)
         payload = request.get_json(silent=True) or {}
-        for key in ("name", "description", "sku", "image_url", "cloudinary_public_id"):
-            if key in payload:
-                setattr(product, key, payload[key])
-        for key in ("is_active", "is_featured"):
-            if key in payload:
-                setattr(product, key, bool(payload[key]))
+        candidate, problem = prepare_product(payload, existing=product)
+        if problem:
+            return error(problem, 400)
+        if candidate.slug != product.slug and Product.query.filter(Product.slug == candidate.slug, Product.id != product.id).first():
+            return error("Product slug already exists", 409)
+        if candidate.sku and Product.query.filter(db.func.lower(Product.sku) == candidate.sku.casefold(), Product.id != product.id).first():
+            return error("SKU already exists", 409)
+        for field in ("name", "slug", "short_description", "description", "price", "compare_at_price", "image_url", "cloudinary_public_id", "sku", "brand", "subcategory", "status", "stock", "weight_kg", "is_active", "is_featured", "category_id", "metadata_json"):
+            setattr(product, field, getattr(candidate, field))
+        if "media" in payload:
+            problem = replace_product_media(product, payload["media"])
+            if problem:
+                db.session.rollback()
+                return error(problem, 400)
+        elif "image_url" in payload and product.image_url:
+            existing_primary = next((media for media in product.media if media.is_primary and media.media_type == "image"), None)
+            if existing_primary:
+                existing_primary.url = product.image_url
+            else:
+                db.session.add(ProductMedia(product=product, media_type="image", url=product.image_url, is_primary=True, alt_text=product.name))
         try:
-            if "price" in payload:
-                product.price = Decimal(str(payload["price"]))
-            if "compare_at_price" in payload:
-                product.compare_at_price = Decimal(str(payload["compare_at_price"])) if payload["compare_at_price"] is not None else None
-            if "stock" in payload:
-                product.stock = int(payload["stock"])
-            if "weight_kg" in payload:
-                product.weight_kg = Decimal(str(payload["weight_kg"])) if payload["weight_kg"] not in (None, "") else None
-            if "category_id" in payload:
-                category = db.session.get(Category, int(payload["category_id"]))
-                if not category:
-                    return error("Category not found", 404)
-                product.category = category
-        except (TypeError, ValueError, InvalidOperation):
-            return error("Invalid price, stock, weight, or category_id", 400)
-        if product.price < 0 or product.stock < 0:
-            return error("Price and stock cannot be negative", 400)
-        if product.weight_kg is not None and (product.weight_kg <= 0 or product.weight_kg > 1000):
-            return error("Product weight must be between 0 and 1000 kg", 400)
-        db.session.commit()
+            db.session.commit()
+        except SQLAlchemyError:
+            db.session.rollback()
+            return error("Could not update product; check that its SKU and URL are unique", 409)
         return jsonify(item=product.to_dict())
+
+    @app.delete("/api/admin/products/<int:product_id>")
+    @admin_required
+    def archive_product(product_id):
+        product = db.session.get(Product, product_id)
+        if not product:
+            return error("Product not found", 404)
+        product.status = "archived"
+        product.is_active = False
+        try:
+            db.session.commit()
+        except SQLAlchemyError:
+            db.session.rollback()
+            return error("Could not archive product", 409)
+        return jsonify(item=product.to_dict(), message="Product archived; order history is preserved")
 
     @app.post("/api/admin/uploads")
     @admin_required
     def upload_image():
-        image = request.files.get("image")
-        if image is None:
-            return error("Choose an image file", 400)
-        if image.mimetype not in {"image/jpeg", "image/png", "image/webp", "image/gif"}:
-            return error("Supported formats are JPEG, PNG, WebP, and GIF", 415)
+        images = request.files.getlist("images") or ([request.files["image"]] if "image" in request.files else [])
+        if not images:
+            return error("Choose at least one image file", 400)
+        if len(images) > 12:
+            return error("Upload up to 12 images at a time", 413)
         if not os.getenv("CLOUDINARY_URL"):
             return error("Cloudinary is not configured", 503)
-        try:
-            result = cloudinary.uploader.upload(
-                image,
-                folder="electrohub/products",
-                resource_type="image",
-                allowed_formats=["jpg", "jpeg", "png", "webp", "gif"],
-            )
-        except Exception:
-            app.logger.exception("Cloudinary upload failed")
-            return error("Image upload failed", 502)
-        return jsonify(image_url=result["secure_url"], public_id=result["public_id"]), 201
+        signatures = {"image/jpeg": (b"\xff\xd8\xff",), "image/png": (b"\x89PNG\r\n\x1a\n",),
+                      "image/webp": (b"RIFF",), "image/gif": (b"GIF87a", b"GIF89a")}
+        validated = []
+        total_bytes = 0
+        for image in images:
+            content = image.stream.read(5 * 1024 * 1024 + 1)
+            image.stream.seek(0)
+            mime = image.mimetype.lower()
+            valid_magic = any(content.startswith(signature) for signature in signatures.get(mime, ()))
+            if not valid_magic or (mime == "image/webp" and content[8:12] != b"WEBP"):
+                return error("Only verified JPEG, PNG, WebP, and GIF image files are accepted", 415)
+            if len(content) > 5 * 1024 * 1024:
+                return error("Each image must be 5 MB or smaller", 413)
+            total_bytes += len(content)
+            if total_bytes > 60 * 1024 * 1024:
+                return error("Combined image uploads must be 60 MB or smaller", 413)
+            validated.append(image)
+        uploaded = []
+        for image in validated:
+            try:
+                result = cloudinary.uploader.upload(image, folder="electrohub/products", resource_type="image",
+                                                    allowed_formats=["jpg", "jpeg", "png", "webp", "gif"])
+            except Exception:
+                app.logger.exception("Cloudinary product image upload failed")
+                return error("Image upload failed", 502)
+            uploaded.append({"image_url": result["secure_url"], "public_id": result["public_id"]})
+        return jsonify(images=uploaded, **uploaded[0]), 201
 
     @app.errorhandler(RequestEntityTooLarge)
     def request_too_large(_exc):

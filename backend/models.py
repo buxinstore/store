@@ -35,7 +35,7 @@ class Category(db.Model):
             "is_active": self.is_active,
         }
         if include_count:
-            result["product_count"] = sum(1 for p in self.products if p.is_active)
+            result["product_count"] = sum(1 for p in self.products if p.is_active and p.status == "active")
         return result
 
 
@@ -50,12 +50,17 @@ class Product(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(180), nullable=False)
     slug = db.Column(db.String(200), nullable=False, unique=True, index=True)
+    short_description = db.Column(db.String(500), nullable=False, default="")
     description = db.Column(db.Text, nullable=False, default="")
     price = db.Column(Numeric(10, 2), nullable=False)
     compare_at_price = db.Column(Numeric(10, 2))
     image_url = db.Column(db.String(1000))
     cloudinary_public_id = db.Column(db.String(300))
     sku = db.Column(db.String(100), unique=True)
+    brand = db.Column(db.String(120))
+    subcategory = db.Column(db.String(120))
+    status = db.Column(db.String(16), nullable=False, default="active", index=True)
+    metadata_json = db.Column(db.Text, nullable=False, default="{}")
     stock = db.Column(db.Integer, nullable=False, default=0)
     weight_kg = db.Column(Numeric(8, 3))
     rating = db.Column(Numeric(2, 1), nullable=False, default=Decimal("0.0"))
@@ -66,6 +71,7 @@ class Product(db.Model):
     updated_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
 
     category = db.relationship("Category", back_populates="products")
+    media = db.relationship("ProductMedia", back_populates="product", cascade="all, delete-orphan", order_by="ProductMedia.display_order, ProductMedia.id", lazy="selectin")
 
     def to_dict(self):
         return {
@@ -73,11 +79,19 @@ class Product(db.Model):
             "name": self.name,
             "slug": self.slug,
             "description": self.description,
+            "short_description": self.short_description,
             "price": float(self.price),
             "compare_at_price": float(self.compare_at_price) if self.compare_at_price is not None else None,
             "image_url": self.image_url,
             "cloudinary_public_id": self.cloudinary_public_id,
             "sku": self.sku,
+            "brand": self.brand,
+            "subcategory": self.subcategory,
+            "tags": self.metadata_value("tags", []),
+            "specifications": self.metadata_value("specifications", {}),
+            "details": self.metadata_value("details", {}),
+            "details": self.metadata_value("details", {}),
+            "status": self.status,
             "stock": self.stock,
             "weight_kg": float(self.weight_kg) if self.weight_kg is not None else None,
             "rating": float(self.rating),
@@ -86,7 +100,46 @@ class Product(db.Model):
             "category_id": self.category_id,
             "category_name": self.category.name if self.category else None,
             "category_slug": self.category.slug if self.category else None,
+            "media": [media.to_dict() for media in self.media],
         }
+
+    def metadata_value(self, key, default=None):
+        try:
+            metadata = json.loads(self.metadata_json or "{}")
+            if key == "details":
+                return {name: value for name, value in metadata.items() if name not in {"tags", "specifications"}}
+            return metadata.get(key, default)
+        except (TypeError, ValueError):
+            return default
+
+
+class ProductMedia(db.Model):
+    __tablename__ = "product_media"
+    __table_args__ = (Index("ix_product_media_product_order", "product_id", "display_order"),)
+
+    id = db.Column(db.Integer, primary_key=True)
+    product_id = db.Column(db.Integer, db.ForeignKey("products.id", ondelete="CASCADE"), nullable=False, index=True)
+    media_type = db.Column(db.String(12), nullable=False)
+    url = db.Column(db.String(2000), nullable=False)
+    title = db.Column(db.String(240))
+    alt_text = db.Column(db.String(300))
+    is_primary = db.Column(db.Boolean, nullable=False, default=False)
+    display_order = db.Column(db.Integer, nullable=False, default=0)
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow)
+    product = db.relationship("Product", back_populates="media")
+
+    def to_dict(self):
+        return {"id": self.id, "type": self.media_type, "url": self.url, "title": self.title,
+                "alt_text": self.alt_text, "is_primary": self.is_primary, "display_order": self.display_order}
+
+
+class ProductExcelImport(db.Model):
+    __tablename__ = "product_excel_imports"
+    id = db.Column(db.String(36), primary_key=True)
+    payload = db.Column(db.Text, nullable=False)
+    preview = db.Column(db.Text, nullable=False)
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow)
+    consumed_at = db.Column(db.DateTime(timezone=True))
 
 
 class Order(db.Model):
@@ -155,6 +208,7 @@ class OrderItem(db.Model):
     image_url = db.Column(db.String(1000))
     unit_price = db.Column(Numeric(10, 2), nullable=False)
     quantity = db.Column(db.Integer, nullable=False)
+    inventory_tracked = db.Column(db.Boolean, nullable=False, default=True)
     order = db.relationship("Order", back_populates="items")
 
     def to_dict(self):
@@ -164,6 +218,7 @@ class OrderItem(db.Model):
             "image_url": self.image_url,
             "unit_price": float(self.unit_price),
             "quantity": self.quantity,
+            "inventory_tracked": self.inventory_tracked,
         }
 
 
