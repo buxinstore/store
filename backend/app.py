@@ -1708,7 +1708,7 @@ def create_app(test_config=None):
                     update_data["specifications"] = row["specifications"]
                 if row["tags"] is not None:
                     update_data["tags"] = row["tags"]
-                if "Product Image" in provided:
+                if "Product image" in provided:
                     update_data["image_url"] = row["primary_image_url"] or None
                 candidate, problem = prepare_product(update_data, existing=product)
                 if problem:

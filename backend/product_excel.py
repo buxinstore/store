@@ -10,7 +10,7 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 
 
-PRODUCT_HEADERS = ["Product Name", "SKU", "Category", "Price", "Stock", "Product Image"]
+PRODUCT_HEADERS = ["Product name", "SKU", "Category", "Price (USD)", "Stock", "Product image"]
 MAX_XLSX_BYTES = 4 * 1024 * 1024
 MAX_UNCOMPRESSED_BYTES = 24 * 1024 * 1024
 MAX_PRODUCTS = 1500
@@ -135,11 +135,13 @@ def parse_product_workbook(data, categories, existing_by_sku):
         if not category:
             row_errors.append(f"Category '{category_name or '(blank)'}' does not match an existing category")
         try:
-            price = float(row["Price"])
+            raw_price = row["Price (USD)"]
+            price_value = ("" if raw_price is None else str(raw_price)).strip().replace("$", "").replace(",", "")
+            price = float(price_value)
             if not math.isfinite(price) or price < 0 or price > 99999999.99:
                 raise ValueError
         except (TypeError, ValueError, OverflowError):
-            row_errors.append("Price must be a non-negative amount")
+            row_errors.append("Price (USD) must be a non-negative amount")
             price = 0
         try:
             raw_stock = float(row["Stock"])
@@ -149,9 +151,9 @@ def parse_product_workbook(data, categories, existing_by_sku):
         except (TypeError, ValueError, OverflowError):
             row_errors.append("Stock must be a non-negative whole number")
             stock = 0
-        image_url = safe_image_url(row["Product Image"])
-        if row["Product Image"] not in (None, "") and not image_url:
-            row_errors.append("Product Image must be a public HTTPS image URL")
+        image_url = safe_image_url(row["Product image"])
+        if row["Product image"] not in (None, "") and not image_url:
+            row_errors.append("Product image must be a public HTTPS image URL")
         if row_errors:
             errors.extend({"row": row_number, "sheet": "Products", "message": message} for message in row_errors)
             continue
@@ -163,7 +165,7 @@ def parse_product_workbook(data, categories, existing_by_sku):
             "slug": _slug(name),
             "category_id": category.id,
             "category_name": category.name,
-            "price": str(row["Price"]),
+            "price": price_value,
             "stock": stock,
             "primary_image_url": image_url,
             "short_description": "",

@@ -14,7 +14,7 @@ class ProductExcelTests(unittest.TestCase):
     def workbook(self, *rows):
         workbook = load_workbook(build_product_template())
         sheet = workbook["Products"]
-        for row in rows or (("Temperature Sensor", "SENSOR-1", "Sensors", 4.25, 12, "https://images.example.com/a.jpg"),):
+        for row in rows or (("Temperature Sensor", "SENSOR-1", "Sensors", "$4.25", 12, "https://images.example.com/a.jpg"),):
             sheet.append(row)
         output = BytesIO()
         workbook.save(output)
@@ -45,7 +45,7 @@ class ProductExcelTests(unittest.TestCase):
         result = self.parse(self.workbook(("Sensor", "S-2", "Sensors", 3, 1, None)))
         self.assertEqual(result["errors"], [])
         self.assertEqual(result["products"][0]["primary_image_url"], "")
-        self.assertNotIn("Product Image", result["products"][0]["provided"])
+        self.assertNotIn("Product image", result["products"][0]["provided"])
 
     def test_duplicate_sku_and_invalid_category_reported(self):
         result = self.parse(self.workbook(
@@ -63,7 +63,7 @@ class ProductExcelTests(unittest.TestCase):
 
     def test_invalid_private_image_url_is_rejected(self):
         result = self.parse(self.workbook(("Sensor", "S-1", "Sensors", 3, 1, "https://127.0.0.1/private.png")))
-        self.assertTrue(any("Product Image" in error["message"] for error in result["errors"]))
+        self.assertTrue(any("Product image" in error["message"] for error in result["errors"]))
 
     def test_existing_media_validator_name_remains_available(self):
         self.assertTrue(safe_external_url("https://images.example.com/a.png", "image"))
